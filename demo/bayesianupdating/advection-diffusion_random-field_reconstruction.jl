@@ -97,7 +97,7 @@ function forward_solve_imex(d::AbstractVector, u0::AbstractVector,
                              adp::AdvDiffProb, 
                              dt::Real, nsteps::Int, n_out::Int)      
     # CFL check
-    @assert dt <= min(adp.dx*abs(vx),adp.dy*abs(vy)) "dt should be smaller than $(min(adp.dx*abs(vx),adp.dy*abs(vy)))"
+    @assert dt <= min(adp.dx/abs(vx),adp.dy/abs(vy)) "dt should be smaller than $(min(adp.dx*abs(vx),adp.dy*abs(vy)))"
     
     # get operator-matrices                         
     Dmat = diffusion_operator(d, adp)
@@ -128,8 +128,8 @@ nx, ny = 51, 31     # points per dim
 hx, hy = 0.2, 0.2   # grid size per dim
 vx, vy = 1.0, 0.5   # sclar velocity per dim
 kx, ky = 2, 3       # u0 half sin-frequency per dim, e.g. sin.(π*kx .* xvec ./ Lx)
-dt     = 0.05       # time step size
-nsteps = 100        # number of time steps 
+dt     = 0.01       # time step size
+nsteps = 500        # number of time steps 
 n_out  = 5          # save only (n_out+1) equidistant frames (+1 is the IC)   
 T_reco = 30         # Truncation order for reconstruction 
 T_ref  = 50         # Truncation order for reference solution
@@ -162,7 +162,7 @@ for i = 1:size(u_ref,2)
 end
 plot(p...,layout=(2,3),size=(1000,500))
 
-u_noise = u_ref .+ randn(size(u_ref)) .* σ_noise
+u_noise = max.(u_ref .+ randn(size(u_ref)) .* σ_noise, 0.0)
 #u_noise = u_ref .* (1.0 .+ randn(size(u_ref)) .* σ_noise)
 p = []
 for i = 1:size(u_noise,2)
@@ -187,6 +187,16 @@ function eval_ad_model(df::DataFrame)
         # forward solve
         u_curr = forward_solve_imex(d_curr, ic, vx, vy, adp, dt, nsteps, n_out)
 
+        if minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr)
+            u_curr = forward_solve_imex(d_curr, ic, vx, vy, adp, dt/10, nsteps*10, n_out)
+        end
+
+        if minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr) 
+            @warn("Solution unstable!")
+            print("min,max",minimum(u_curr),",",maximum(u_curr))
+            u_curr .= NaN
+        end
+
         evals[i] = u_curr
     end
 
@@ -197,7 +207,17 @@ ad_model = Model(eval_ad_model, :AdvDiff)
 # define rest for sTMCMC
 function loglikelihood(df)
     evals = df.AdvDiff
-    return [-0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2) for n in eachindex(evals)]
+    log_ll = zeros(length(evals))
+    for n in eachindex(evals)
+        if any(isnan.(evals[n]))
+            log_ll[n] = NaN
+        else
+            log_ll[n] = -0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2)
+        end
+    end
+    log_ll[isnan.(log_ll)] .= minimum(log_ll[.!isnan.(log_ll)]) / 10
+    return log_ll
+    #return [-0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2) for n in eachindex(evals)]
 end
 
 prior = RandomVariable.(Normal(), [Symbol("ξ$(i)") for i in 1:T_reco])
