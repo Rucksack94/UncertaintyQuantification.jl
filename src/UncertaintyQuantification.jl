@@ -166,6 +166,7 @@ export SubSetInfinity
 export SubSetInfinityAdaptive
 export SubSetSimulation
 export TransitionalMarkovChainMonteCarlo
+export SequentialTransitionalMarkovChainMonteCarlo
 export TransportMap
 export TransportMapFromSamples
 export TransportMapBayesian
