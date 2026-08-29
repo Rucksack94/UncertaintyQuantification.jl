@@ -186,14 +186,16 @@ function eval_ad_model(df::DataFrame)
 
         # forward solve
         u_curr = forward_solve_imex(d_curr, ic, vx, vy, adp, dt, nsteps, n_out)
-
-        if minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr)
-            u_curr = forward_solve_imex(d_curr, ic, vx, vy, adp, dt/10, nsteps*10, n_out)
+	
+	refine_count = 0
+        while (refine_count < 3) && (minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr))
+	    refine_count += 1
+            u_curr = forward_solve_imex(d_curr, ic, vx, vy, adp, dt/(5^refine_count), nsteps*(5^refine_count), n_out)
         end
 
         if minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr) 
             @warn("Solution unstable!")
-            print("min,max",minimum(u_curr),",",maximum(u_curr))
+            print("min,max",minimum(u_curr),",",maximum(u_curr), "\n")
             u_curr .= NaN
         end
 
@@ -215,7 +217,8 @@ function loglikelihood(df)
             log_ll[n] = -0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2)
         end
     end
-    log_ll[isnan.(log_ll)] .= minimum(log_ll[.!isnan.(log_ll)]) / 10
+    #log_ll[isnan.(log_ll)] .= minimum(log_ll[.!isnan.(log_ll)]) / 10
+    log_ll[isnan.(log_ll)] .= -1e2
     return log_ll
     #return [-0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2) for n in eachindex(evals)]
 end
@@ -223,53 +226,54 @@ end
 prior = RandomVariable.(Normal(), [Symbol("ξ$(i)") for i in 1:T_reco])
 
 nrv_vec = [5:5:T_reco;]
+#nrv_vec = [5:5:10;]
 particle_factor = 10
-burnin = 5
+burnin = 2
 seqtmcmc = SequentialTransitionalMarkovChainMonteCarlo(prior, nrv_vec, particle_factor, burnin)
 
 # eval SeqTMCMC (model_calls = 79650)
-stmcmc_samples, stmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], seqtmcmc)
-final_coefs_seq = Matrix(stmcmc_samples[:,names(prior)]) 
-s_reco_seq = vec(sum(final_coefs_seq, dims=1)./size(final_coefs_seq,1))
-d_reco_seq = sample_d(s_reco_seq)
-u_reco_seq = forward_solve_imex(d_reco_seq, u0, vx, vy, adp, dt, nsteps, n_out)
+stmcmc_samples, stmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], seqtmcmc);
+final_coefs_seq = Matrix(stmcmc_samples[:,names(prior)]) ;
+s_reco_seq = vec(sum(final_coefs_seq, dims=1)./size(final_coefs_seq,1));
+d_reco_seq = sample_d(s_reco_seq);
+u_reco_seq = forward_solve_imex(d_reco_seq, u0, vx, vy, adp, dt, nsteps, n_out);
 
 # eval TMCMC (model_calls = 45300)
-ntmcmc = nrv_vec[end] * particle_factor
-tmcmc = TransitionalMarkovChainMonteCarlo(prior, ntmcmc, burnin)
-tmcmc_samples, tmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], tmcmc)
-final_coefs = Matrix(tmcmc_samples[:,names(prior)]) 
-s_reco = vec(sum(final_coefs, dims=1)./size(final_coefs,1))
-d_reco = sample_d(s_reco)
-u_reco = forward_solve_imex(d_reco, u0, vx, vy, adp, dt, nsteps, n_out)
+ntmcmc = nrv_vec[end] * particle_factor;
+tmcmc = TransitionalMarkovChainMonteCarlo(prior, ntmcmc, burnin);
+tmcmc_samples, tmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], tmcmc);
+final_coefs = Matrix(tmcmc_samples[:,names(prior)]) ;
+s_reco = vec(sum(final_coefs, dims=1)./size(final_coefs,1));
+d_reco = sample_d(s_reco);
+u_reco = forward_solve_imex(d_reco, u0, vx, vy, adp, dt, nsteps, n_out);
 
 # compute low order reference
-s_ref_low = (grf.data.eigenfunc[:, 1:T_reco] * Diagonal(grf.data.eigenval[1:T_reco])) \ log.(d_ref ./ 0.1)
-d_ref_low = sample_d(s_ref_low)
+s_ref_low = (grf.data.eigenfunc[:, 1:T_reco] * Diagonal(grf.data.eigenval[1:T_reco])) \ log.(d_ref ./ 0.1);
+d_ref_low = sample_d(s_ref_low);
 
 # Boxplot RF coefficients
 final_coefs_seq .-= s_ref_low[1:T_reco]' 
 final_coefs .-= s_ref_low[1:T_reco]' 
 bp = StatsPlots.boxplot(repeat(1:T_reco, inner=size(final_coefs_seq,1)), vec(final_coefs_seq);
-        xlabel="mode index", ylabel="ξ_reco - ξ_ref", outliers=false, label="seqTMCMC",linewidth=0)
+        xlabel="mode index", ylabel="ξ_reco - ξ_ref", outliers=false, label="seqTMCMC",linewidth=0);
 StatsPlots.boxplot!(bp,repeat(1:T_reco, inner=size(final_coefs,1)), vec(final_coefs);
-        outliers=false, label="TMCMC",fillalpha=0.75,linewidth=0,legend=:outertop,legend_columns=2)
+        outliers=false, label="TMCMC",fillalpha=0.75,linewidth=0,legend=:outertop,legend_columns=2);
 plot!(bp,size=(800,500),guidefontsize=16,tickfontsize=14,legendfontsize=16,xticks=nrv_vec)
 
 
 # Mixed Root Mean Square (MRMS) error
-mrms(ref,approx) = sqrt(sum( ((ref .- approx)/(1.0 .+ abs.(ref))).^2 )/prod(size(ref))) 
-d_mrms_seq = mrms(d_reco_seq,d_ref_low) 
-d_mrms = mrms(d_reco,d_ref_low)
-u_true_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_ref)) 
-u_true_mrms = mrms(Matrix(u_reco),Matrix(u_ref))
-u_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_noise)) 
-u_mrms = mrms(Matrix(u_reco),Matrix(u_noise))
-ulocal_true_mrms_seq = mrms.(Matrix(u_reco_seq),Matrix(u_ref)) 
-ulocal_true_mrms = mrms.(Matrix(u_reco),Matrix(u_ref))
-ulocal_mrms_seq = mrms.(Matrix(u_reco_seq),Matrix(u_noise)) 
-ulocal_mrms = mrms.(Matrix(u_reco),Matrix(u_noise))
-maxMRMS = max(maximum(ulocal_true_mrms_seq),maximum(ulocal_true_mrms))
+mrms(ref,approx) = sqrt(sum( ((ref .- approx)/(1.0 .+ abs.(ref))).^2 )/prod(size(ref))) ;
+d_mrms_seq = mrms(d_reco_seq,d_ref_low) ;
+d_mrms = mrms(d_reco,d_ref_low);
+u_true_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_ref)) ;
+u_true_mrms = mrms(Matrix(u_reco),Matrix(u_ref));
+u_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_noise)) ;
+u_mrms = mrms(Matrix(u_reco),Matrix(u_noise));
+ulocal_true_mrms_seq = mrms.(Matrix(u_reco_seq),Matrix(u_ref)) ;
+ulocal_true_mrms = mrms.(Matrix(u_reco),Matrix(u_ref));
+ulocal_mrms_seq = mrms.(Matrix(u_reco_seq),Matrix(u_noise)) ;
+ulocal_mrms = mrms.(Matrix(u_reco),Matrix(u_noise));
+maxMRMS = max(maximum(ulocal_true_mrms_seq),maximum(ulocal_true_mrms));
 
 # Heatmap diffusion fields
 href  = heatmap(xunique,yunique,reshape(d_ref,(nx,ny))',clims=(0.0,1.5),title="Reference TO=$(T_ref)");

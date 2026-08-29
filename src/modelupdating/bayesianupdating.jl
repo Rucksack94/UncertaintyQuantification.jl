@@ -146,7 +146,7 @@ Alternative constructors
 
 ```julia
     TransitionalMarkovChainMonteCarlo(prior, n, burnin, β)  # `islog` = true
-TransitionalMarkovChainMonteCarlo(prior, n, burnin)    # `β` = 0.2,  `islog` = true
+    TransitionalMarkovChainMonteCarlo(prior, n, burnin)    # `β` = 0.2,  `islog` = true
 ```
 
 # References
@@ -186,6 +186,7 @@ function bayesianupdating(
     covariance_method = LinearShrinkage(DiagonalUnitVariance(), :lw)
 
     rv_names = names(tmcmc.prior)
+    n_rv = length(rv_names)
 
     j = 0 # iteration
     βⱼ = 0.0 # tempering
@@ -218,7 +219,9 @@ function bayesianupdating(
         θⱼ⁺ = θⱼ[idx, :]
 
         Σⱼ = tmcmc.β^2 * cov(covariance_method, Matrix(θⱼ⁺[:, rv_names]))
-
+        
+        U = cholesky(Σⱼ).U   # factorize once for MvNormal sampler in MH part
+            
         # Run inner MH algorithm
 
         chain = Vector{DataFrame}(undef, tmcmc.burnin + 2)
@@ -234,20 +237,18 @@ function bayesianupdating(
         for i in 2:(tmcmc.burnin + 2)
             next = copy(chain[i - 1])
 
-            for (j, x) in enumerate(eachrow(next[:, rv_names]))
-                next[j, rv_names] = rand(MvNormal(collect(x), Σⱼ))
-            end
+            next[:, rv_names] = Matrix(next[:, rv_names]) .+ randn(tmcmc.n, n_rv) * U
 
             # safeguard for Inf in the prior
-            # !TODO: Find a cleaner way to do this
-            idx_inf = findall(isinf, prior(next))
+            idx_inf = findall(isinf, prior(next[:, rv_names]))
 
             while !isempty(idx_inf)
-                for (j, x) in zip(idx_inf, (eachrow(chain[i - 1][idx_inf, rv_names])))
-                    next[j, rv_names] = rand(MvNormal(collect(x), Σⱼ))
-                end
-
-                idx_inf = findall(isinf, prior(next))
+            
+                means = Matrix(chain[i - 1][idx_inf, rv_names])
+                next[idx_inf, rv_names] = means .+ randn(length(idx_inf), n_rv) * U
+            
+                still_inf = isinf.(prior(next[idx_inf, rv_names]))            # only re-check candidates
+                idx_inf = idx_inf[still_inf]
             end
 
             if !isempty(models)
@@ -318,7 +319,7 @@ Alternative constructors
 
 ```julia
     SequentialTransitionalMarkovChainMonteCarlo(prior, nrv_vec, particle_factor, burnin, β)  # `islog` = true
-SequentialTransitionalMarkovChainMonteCarlo(prior, nrv_vec, particle_factor, burnin)    # `β` = 0.2,  `islog` = true
+    SequentialTransitionalMarkovChainMonteCarlo(prior, nrv_vec, particle_factor, burnin)    # `β` = 0.2,  `islog` = true
 ```
 
 # References
@@ -379,24 +380,24 @@ function bayesianupdating(
     n_old = 0
         
     # outer loop over the number of random variables
-    for (stage, nrv) in enumerate(stmcmc.nrv_vec)
+    for (stage, n_rv) in enumerate(stmcmc.nrv_vec)
 
         @debug "Stage" stage
 
         # stage initialization
-        rv_names = names(stmcmc.prior[1:nrv])       # names of "active" rvs in this stage
+        rv_names = names(stmcmc.prior[1:n_rv])       # names of "active" rvs in this stage
         j = 0                                       # iteration counter in current stage
         
-        # NOTE
-        # currently kind of heuristic approach to get number of samples 
-        n_curr = length(stmcmc.particle_factor) == 1 ? nrv*stmcmc.particle_factor : nrv*stmcmc.particle_factor[stage]
+        # !TODO:
+        # currently kind of heuristic approach to get number of samples - might be a better one 
+        n_curr = length(stmcmc.particle_factor) == 1 ? n_rv*stmcmc.particle_factor : n_rv*stmcmc.particle_factor[stage]
             
         # for stage 1 additional initalization (same as TMCMC)
         if stage == 1
             
             βⱼ = 0.0                                    # tempering
             
-            θⱼ = sample(stmcmc.prior[1:nrv], n_curr)   # prior samples
+            θⱼ = sample(stmcmc.prior[1:n_rv], n_curr)   # prior samples
             
             # eval forward model if supplied
             if !isempty(models)
@@ -404,8 +405,9 @@ function bayesianupdating(
             end
         
         else    # for stage >= 2 use previous results for initialization
+            
             # compute likelihood from final coefficients of previous stage 
-            likelihood_old = stmcmc.islog ? likelihood(θⱼ) : log.(likelihood(θⱼ))
+            #likelihood_old = stmcmc.islog ? likelihood(θⱼ) : log.(likelihood(θⱼ))
             
             # duplicate samples to match the new number of particles
             if mod(n_curr,n_old) == 0      # int-type duplication  
@@ -417,10 +419,10 @@ function bayesianupdating(
             
             # sample injection to match current number of particles
             θ_old = θⱼ[idx_dup, :]                      
-            likelihood_old = likelihood_old[idx_dup]
+            #likelihood_old = likelihood_old[idx_dup]
             
-            # sample new RVs added in current stage for every particle
-            θ_new = sample(stmcmc.prior[size(θ_old,2):nrv], n_curr) 
+            # sample new RVs (added dimenions per particle) introduced in current stage
+            θ_new = sample(stmcmc.prior[size(θ_old,2):n_rv], n_curr) 
             θ_curr = hcat(θ_old, θ_new)         # new samples with new RVs added
             
             # evaluate new likelihood
@@ -431,12 +433,17 @@ function bayesianupdating(
 
             # compute initial β for current stage using the previous stage's likelihoods
             adjust_curr = Distributions.maximum(likelihood_curr)
-            adjust_old  = Distributions.maximum(likelihood_old)
+            adjust_old  = 0.0 # Distributions.maximum(likelihood_old)
             L_curr = likelihood_curr .- adjust_curr
-            L_old  = likelihood_old  .- adjust_old             
+            #L_old  = likelihood_old  .- adjust_old
+            
+            # !TODO: 
+            # The idea was here to compute an initial β > 0.0, to reflect the "informed" dimensions in the subsequent TMCMC
+            # Sadly did not worked out and got β = eps() here, since COV(L_old) >> 1
+            #
             # use modified version here since we need to get initial β (here γ) 
             # compute based on new weights are w = γ * L_curr - β_old * L_old (β_old = 1) 
-            γ, wⱼ = _beta_and_weights(0.0, L_curr; extra = L_old)
+            γ, wⱼ = _beta_and_weights(0.0, L_curr; extra = nothing)
 
             # resample based on the new weights to get the initial samples for the current stage
             weights = FrequencyWeights(wⱼ ./ sum(wⱼ))
@@ -472,6 +479,8 @@ function bayesianupdating(
             
             Σⱼ = stmcmc.β^2 * cov(covariance_method, Matrix(θⱼ⁺[:, rv_names]))
 
+            U = cholesky(Σⱼ).U   # factorize once for MvNormal sampler in MH part
+
             # Run inner MH algorithm
             
             chain = Vector{DataFrame}(undef, stmcmc.burnin + 2)
@@ -487,20 +496,18 @@ function bayesianupdating(
             for i in 2:(stmcmc.burnin + 2)
                 next = copy(chain[i - 1])
 
-                for (j, x) in enumerate(eachrow(next[:, rv_names]))
-                    next[j, rv_names] = rand(MvNormal(collect(x), Σⱼ))
-                end
+                next[:, rv_names] = Matrix(next[:, rv_names]) .+ randn(n_curr, n_rv) * U
 
                 # safeguard for Inf in the prior
-                # !TODO: Find a cleaner way to do this
-                idx_inf = findall(isinf, prior(next[:,rv_names]))
+                idx_inf = findall(isinf, prior(next[:, rv_names]))
 
                 while !isempty(idx_inf)
-                    for (j, x) in zip(idx_inf, (eachrow(chain[i - 1][idx_inf, rv_names])))
-                        next[j, rv_names] = rand(MvNormal(collect(x), Σⱼ))
-                    end
-
-                    idx_inf = findall(isinf, prior(next[:,rv_names]))
+                
+                    means = Matrix(chain[i - 1][idx_inf, rv_names]) 
+                    next[idx_inf, rv_names] = means .+ randn(length(idx_inf), n_rv) * U
+                
+                    still_inf = isinf.(prior(next[idx_inf, rv_names]))            # only re-check candidates
+                    idx_inf = idx_inf[still_inf]
                 end
 
                 if !isempty(models)
@@ -570,9 +577,9 @@ end
         #        = L_j(θ)^x / L_j(θ)^β        i.e. p(θ)/q(θ) with q,p sharing the SAME likelihood L_j
         #
     # Dimension-extension stage (extra = L_old, called with β = 0):
-        #   w(x) = exp[ x * L_curr - L_old ]
-        #        = L_curr(θ)^x / L_old(θ_old)^1
-        #   i.e. p(θ)/q(θ) = L_curr(θ)^γ * π₀(θ) / ( L_old(θ_old)^{β_old=1} * π₀(θ) )
+        #   w(γ) = eγp[ γ * L_curr - L_old ]
+        #        = L_curr(θ)^γ / L_old(θ_old)^1
+        #   i.e. w(γ) = p(γ|θ)/q(γ|θ) = L_curr(θ)^γ * π₀(θ) / ( L_old(θ_old)^{β_old=1} * π₀(θ) )
         #   with L_curr passed in as L, and extra = L_old accounting for
         #   the β_old = 1 enrichment already present in θ_old from the previous stage.
 
