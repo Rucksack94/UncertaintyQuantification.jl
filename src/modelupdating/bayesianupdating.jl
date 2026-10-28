@@ -422,7 +422,7 @@ function bayesianupdating(
             #likelihood_old = likelihood_old[idx_dup]
             
             # sample new RVs (added dimenions per particle) introduced in current stage
-            θ_new = sample(stmcmc.prior[size(θ_old,2):n_rv], n_curr) 
+            θ_new = sample(stmcmc.prior[n_old+1:n_rv], n_curr) 
             θ_curr = hcat(θ_old, θ_new)         # new samples with new RVs added
             
             # evaluate new likelihood
@@ -564,6 +564,256 @@ end
 
 function bayesianupdating(
         prior::Function, likelihood::Function, tmcmc::SequentialTransitionalMarkovChainMonteCarlo
+    )
+    return bayesianupdating(prior, likelihood, UQModel[], stmcmc)
+end
+
+"""
+    SequentialTransitionalMarkovChainMonteCarloV2(prior, nrv_vec, particle_factor, burnin, β, islog)
+"""
+
+struct SequentialTransitionalMarkovChainMonteCarloV2 <: AbstractBayesianMethod # Transitional Markov Chain Monte Carlo
+    prior::Vector{<:RandomVariable{<:UnivariateDistribution}}
+    nrv_vec::Vector{Int}
+    particle_factor::Union{Int,Vector{Int}}
+    burnin::Int
+    β::Real
+    islog::Bool
+
+    function SequentialTransitionalMarkovChainMonteCarloV2(
+            prior::Vector{<:RandomVariable{<:UnivariateDistribution}},
+            nrv_vec::Vector{Int}, 
+            particle_factor::Union{Int,Vector{Int}},
+            burnin::Int,
+            β::Real = 0.2,
+            islog::Bool = true,
+        )
+        if any(nrv_vec .<= 0)
+            error("Number of random variables per stage defined by `nrv_vec` must be positive")
+        end
+
+        if length(nrv_vec) > 1 && any(nrv_vec[1:end-1] .> nrv_vec[2:end])
+            error("`nrv_vec` must be strictly monotonic increasing")
+        end
+
+        if nor(length(particle_factor) == 1, length(particle_factor) == length(nrv_vec))  
+            error("`particle_factor` must be either length=1 or length(nrv_vec)")
+        end
+
+        if any(particle_factor .<= 0)
+            error("Factor to compute number of particles `particle_factor` must be positive")
+        end
+
+        return new(prior, nrv_vec, particle_factor, burnin, β, islog)
+    end
+end
+
+# sequential TMCMC implementation
+function bayesianupdating(
+        prior::Function,
+        likelihood::Function,
+        models::Vector{<:UQModel},
+        stmcmc::SequentialTransitionalMarkovChainMonteCarloV2,
+    )
+    # initialization
+    covariance_method = LinearShrinkage(DiagonalUnitVariance(), :lw)
+    
+    S = 0.0    
+    
+    local_stage = 0
+    model_calls = 0
+    
+    θⱼ = DataFrame()
+    θ_old = DataFrame()
+    
+    n_old = 0
+    likelihood_old = Vector{Float64}()
+
+    # outer loop over the number of random variables
+    for (stage, n_rv) in enumerate(stmcmc.nrv_vec)
+
+        @debug "Stage" stage
+
+        # stage initialization
+        rv_names = names(stmcmc.prior[1:n_rv])       # names of "active" rvs in this stage
+        j = 0                                       # iteration counter in current stage
+        
+        # !TODO:
+        # currently kind of heuristic approach to get number of samples - might be a better one 
+        n_curr = length(stmcmc.particle_factor) == 1 ? n_rv*stmcmc.particle_factor : n_rv*stmcmc.particle_factor[stage]
+            
+        # for stage 1 additional initalization (same as TMCMC)
+        if stage == 1
+            
+            βⱼ = 0.0                                    # tempering
+            
+            θⱼ = sample(stmcmc.prior[1:n_rv], n_curr)   # prior samples
+            
+            # eval forward model if supplied
+            if !isempty(models)
+                evaluate!(models, θⱼ)
+            end
+        
+        else    # for stage >= 2 use previous results for initialization
+            
+            βⱼ = 0.0                                    # tempering
+
+            # duplicate samples to match the new number of particles
+            if mod(n_curr,n_old) == 0      # int-type duplication  
+                k_tile = div(n_curr, n_old)
+                idx_dup = repeat(1:n_old, k_tile)
+            else    # uniform resampling
+                idx_dup = StatsBase.sample(1:n_old, n_curr; replace=true)
+            end
+            
+            # sample injection to match current number of particles
+            θ_old = θⱼ[idx_dup, :]                      
+            
+            # sample new RVs (added dimenions per particle) introduced in current stage
+            θ_new = sample(stmcmc.prior[n_old+1:n_rv], n_curr) 
+            θ_curr = hcat(θ_old, θ_new)         # new samples with new RVs added
+            
+            # evaluate new likelihood
+            if !isempty(models)
+                evaluate!(models, θ_curr)
+            end
+
+            θⱼ = θ_curr
+            
+            @debug "Finished initialization of stage $(stage), starting with β=$(βⱼ) and S=$(S)!"
+        end
+
+        # inner β loop
+        while βⱼ < 1
+            j += 1
+            
+            likelihood_j = stmcmc.islog ? likelihood(θⱼ) : log.(likelihood(θⱼ))
+            if stage == 1
+                likelihood_old = zeros(length(likelihood_j))
+            else
+                likelihood_old = stmcmc.islog ? likelihood(θ_old) : log.(likelihood(θ_old))
+            end
+            
+            diff_ll = likelihood_j .- likelihood_old   # essentially we do log_ll_j*βⱼ + log_ll_old*(1-βⱼ)
+            adjust = Distributions.maximum(diff_ll)
+
+            βⱼ⁺, wⱼ = _beta_and_weights(βⱼ, diff_ll .- adjust) 
+
+            @debug "βⱼ" βⱼ⁺
+
+            S += log(mean(wⱼ)) + (βⱼ⁺ - βⱼ) * adjust
+            
+            weights = FrequencyWeights(wⱼ ./ sum(wⱼ))
+            
+            idx = StatsBase.sample(collect(1:(n_curr)), weights, n_curr; replace=true)
+            
+            θⱼ⁺ = θⱼ[idx, :]
+            
+            Σⱼ = stmcmc.β^2 * cov(covariance_method, Matrix(θⱼ⁺[:, rv_names]))
+
+            U = cholesky(Σⱼ).U   # factorize once for MvNormal sampler in MH part
+
+            # Run inner MH algorithm
+            
+            chain = Vector{DataFrame}(undef, stmcmc.burnin + 2)
+            
+            chain[1] = copy(θⱼ⁺)
+            prior_old = prior(θⱼ⁺[:, rv_names])
+            likelihood_old = likelihood_j[idx] 
+            
+            for i in 2:(stmcmc.burnin + 2)
+                next = copy(chain[i - 1])
+
+                next[:, rv_names] = Matrix(next[:, rv_names]) .+ randn(n_curr, n_rv) * U
+                θ_old = next[:,rv_names[1:n_old]]
+
+                # safeguard for Inf in the prior
+                idx_inf = findall(isinf, prior(next[:, rv_names]))
+
+                while !isempty(idx_inf)
+                
+                    means = Matrix(chain[i - 1][idx_inf, rv_names]) 
+                    next[idx_inf, rv_names] = means .+ randn(length(idx_inf), n_rv) * U
+                
+                    still_inf = isinf.(prior(next[idx_inf, rv_names]))            # only re-check candidates
+                    idx_inf = idx_inf[still_inf]
+                end
+
+                if !isempty(models)
+                    evaluate!(models, next)
+                    (stage > 1) && (evaluate!(models, θ_old))
+                end
+
+                logL_full  = stmcmc.islog ? likelihood(next) : log.(likelihood(next)) 
+                if stage > 1
+                    logL_old   = stmcmc.islog ? likelihood(θ_old) : log.(likelihood(θ_old))
+                else
+                    logL_old = length(logL_full)
+                end
+                prior_next = prior(next[:, rv_names])
+
+                log_ratio = (1-βⱼ⁺) .* (logL_old   .- likelihood_old) .+
+                               βⱼ⁺  .* (logL_full  .- likelihood_old) .+
+                                       (prior_next .- prior_old)
+
+                accept = log_ratio .>= log.(rand(n_curr))
+
+                reject = .!accept
+
+                next[reject, :] .= chain[i - 1][reject, :]
+
+                chain[i] = next
+
+                prior_old = prior(next[:, rv_names])
+                likelihood_old[accept] = logL_full[accept]
+            end
+
+            θⱼ⁺ = chain[end] 
+
+            βⱼ = βⱼ⁺
+            θⱼ = θⱼ⁺
+
+            if stage > 1
+                θ_old = θⱼ[:, rv_names[1:n_old]]
+                if !isempty(models)
+                    evaluate!(models, θ_old)
+                end
+            end
+
+        end # β loop
+
+        model_calls += n_curr * (1 + j * (1 + stmcmc.burnin)) .* (1 + Int(stage>1))
+        n_old = n_curr
+        
+    end # stage loop
+
+    @debug "Model Calls" model_calls
+
+    return θⱼ, S
+end
+
+function bayesianupdating(
+        likelihood::Function,
+        models::Vector{<:UQModel},
+        stmcmc::SequentialTransitionalMarkovChainMonteCarloV2,
+    )
+    prior = if stmcmc.islog
+        df -> vec(
+            sum(hcat(map(rv -> logpdf.(rv.dist, df[:, rv.name]), stmcmc.prior[1:ncol(df)])...); dims = 2),
+        )
+    else
+        df -> vec(prod(hcat(map(rv -> pdf.(rv.dist, df[:, rv.name]), stmcmc.prior[1:ncol(df)])...); dims = 2))
+    end
+
+    return bayesianupdating(prior, likelihood, models, stmcmc)
+end
+
+function bayesianupdating(likelihood::Function, stmcmc::SequentialTransitionalMarkovChainMonteCarloV2)
+    return bayesianupdating(likelihood, UQModel[], stmcmc)
+end
+
+function bayesianupdating(
+        prior::Function, likelihood::Function, tmcmc::SequentialTransitionalMarkovChainMonteCarloV2
     )
     return bayesianupdating(prior, likelihood, UQModel[], stmcmc)
 end
