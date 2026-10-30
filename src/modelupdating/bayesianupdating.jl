@@ -219,9 +219,10 @@ function bayesianupdating(
         θⱼ⁺ = θⱼ[idx, :]
 
         Σⱼ = tmcmc.β^2 * cov(covariance_method, Matrix(θⱼ⁺[:, rv_names]))
-        
-        U = cholesky(Σⱼ).U   # factorize once for MvNormal sampler in MH part
-            
+
+        # creating zero-means MvNormal, since cov stays constant along MCMC chains
+        mv_normal = MvNormal(zeros(n_rv), Σⱼ)
+
         # Run inner MH algorithm
 
         chain = Vector{DataFrame}(undef, tmcmc.burnin + 2)
@@ -237,17 +238,18 @@ function bayesianupdating(
         for i in 2:(tmcmc.burnin + 2)
             next = copy(chain[i - 1])
 
-            next[:, rv_names] = Matrix(next[:, rv_names]) .+ randn(tmcmc.n, n_rv) * U
+            next[:, rv_names] = Matrix(next[:, rv_names]) .+ transpose(rand(mv_normal, tmcmc.n))
 
             # safeguard for Inf in the prior
-            idx_inf = findall(isinf, prior(next[:, rv_names]))
+            idx_inf = findall(isinf, prior(next))
 
             while !isempty(idx_inf)
-            
-                means = Matrix(chain[i - 1][idx_inf, rv_names])
-                next[idx_inf, rv_names] = means .+ randn(length(idx_inf), n_rv) * U
-            
-                still_inf = isinf.(prior(next[idx_inf, rv_names]))            # only re-check candidates
+                current_means = Matrix(chain[i - 1][idx_inf, rv_names])
+
+                next[idx_inf, rv_names] = current_means .+ transpose(rand(mv_normal, length(idx_inf)))
+
+                # only re-checking idx_inf candidates
+                still_inf = isinf.(prior(next[idx_inf, rv_names]))
                 idx_inf = idx_inf[still_inf]
             end
 
