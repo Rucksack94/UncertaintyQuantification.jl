@@ -357,6 +357,53 @@ struct RadialBasisSurrogate <: AbstractSurrogateSpec
     RadialBasisSurrogate(; ε::Float64 = 1.0) = new(ε)
 end
 
+"""
+    AbstractTransitionMode
+
+Abstract type for the transition mode used in stages `s >= 2` of [`SequentialTMCMC`](@ref).
+
+Subtypes are:
+
+- [`SurrogateTransition`](@ref) (default)
+- [`FreezeUnfreezeTransition`](@ref)
+"""
+abstract type AbstractTransitionMode end
+
+"""
+    SurrogateTransition(; surrogate = PCESurrogate(), surrogate_steps = 5)
+
+Default transition of [`SequentialTMCMC`](@ref): weighted resampling of the previous stage's particles, prior injection of the new dimensions, per-stage surrogate refinement of the particles, and an initial `β > 0` computed from the incremental likelihood.
+"""
+struct SurrogateTransition <: AbstractTransitionMode
+    surrogate::AbstractSurrogateSpec
+    surrogate_steps::Int
+    function SurrogateTransition(;
+            surrogate::AbstractSurrogateSpec = PCESurrogate(), surrogate_steps::Int = 5
+        )
+        surrogate_steps >= 0 ||
+            error("Number of surrogate refinement steps `surrogate_steps` must be non-negative")
+        return new(surrogate, surrogate_steps)
+    end
+end
+
+"""
+    FreezeUnfreezeTransition(; ess_threshold = 0.5)
+
+Alternative transition of [`SequentialTMCMC`](@ref): after growing the particle dimension, the inherited (previously fitted) dimensions are frozen in the MH proposal while the effective sample size (ESS) of the incremental weights is below `ess_threshold * n_curr`; once the ESS stabilizes above the threshold, all active dimensions are unfrozen. Only one likelihood evaluation per MH step is needed.
+"""
+struct FreezeUnfreezeTransition <: AbstractTransitionMode
+    ess_threshold::Float64
+    function FreezeUnfreezeTransition(; ess_threshold::Float64 = 0.5)
+        0 < ess_threshold <= 1 || error("`ess_threshold` must be in (0, 1]")
+        return new(ess_threshold)
+    end
+end
+
+function _ess(w::AbstractVector{<:Real})
+    p = w ./ sum(w)
+    return 1 / sum(p .^ 2)
+end
+
 function _surrogate_input_names(d::Int)
     return [Symbol("ξ$i") for i in 1:d]
 end
@@ -419,7 +466,7 @@ function _surrogate_refine(
 end
 
 """
-    SequentialTMCMC(prior, nrv_vec, particle_factor, burnin, β, islog; surrogate = PCESurrogate(), surrogate_steps = 5)
+    SequentialTMCMC(prior, nrv_vec, particle_factor, burnin, β, islog; transition = SurrogateTransition())
 
     Passed to [`bayesianupdating`](@ref) to run a sequential (dimension-growing) version of the Transitional Markov Chain Monte Carlo algorithm with [`RandomVariable`](@ref) vector `prior`.
     The number of stages are implicitly defined via `length(nrv_vec)`.
@@ -429,15 +476,17 @@ end
     Alternatively, `particle_factor` can be a vector having the same length as `nrv_vec`, and the number of Markov chains will be `n=nrv_vec[s]*particle_factor[s]`.
     The flag `islog` specifies whether the prior and likelihood functions passed to the [`bayesianupdating`](@ref) method are already given as logarithms.
 
-    For stages `s >= 2` the transition from the previous stage is performed as follows: the previous stage's particles are resampled according to their final (posterior) weights, the newly added dimensions are initialized from the prior and evaluated once with the forward model, a surrogate of the log-likelihood is fitted per stage to the resulting samples and used to refine the particles with a short surrogate-only Markov chain (no forward model evaluations), and finally an initial tempering value `β > 0` is computed from the incremental likelihood `L_curr - L_old` via bisection.
-    The surrogate type is selected via the keyword `surrogate` (default [`PCESurrogate`](@ref); alternatives are [`ResponseSurfaceSurrogate`](@ref) and [`RadialBasisSurrogate`](@ref)) and the number of surrogate refinement steps via `surrogate_steps` (`0` disables the refinement).
+    For stages `s >= 2` the transition from the previous stage is controlled by the keyword `transition`:
+    - [`SurrogateTransition`](@ref) (default): the previous stage's particles are resampled according to their final (posterior) weights, the newly added dimensions are initialized from the prior and evaluated once with the forward model, a surrogate of the log-likelihood is fitted per stage to the resulting samples and used to refine the particles with a short surrogate-only Markov chain (no forward model evaluations), and finally an initial tempering value `β > 0` is computed from the incremental likelihood `L_curr - L_old` via bisection.
+    - [`FreezeUnfreezeTransition`](@ref): the inherited dimensions are frozen in the MH proposal until the ESS of the incremental weights stabilizes, then all dimensions are unfrozen. Requires only one likelihood evaluation per MH step.
 
 Alternative constructors
 
 ```julia
     SequentialTMCMC(prior, nrv_vec, particle_factor, burnin, β)                    # `islog` = true
     SequentialTMCMC(prior, nrv_vec, particle_factor, burnin)                        # `β` = 0.2, `islog` = true
-    SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; surrogate = PCESurrogate(p = 4))
+    SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; transition = SurrogateTransition(surrogate = PCESurrogate(p = 4)))
+    SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; transition = FreezeUnfreezeTransition(ess_threshold = 0.5))
 ```
 
 # References
@@ -453,8 +502,7 @@ struct SequentialTMCMC <: AbstractBayesianMethod
     burnin::Int
     β::Real
     islog::Bool
-    surrogate::AbstractSurrogateSpec
-    surrogate_steps::Int
+    transition::AbstractTransitionMode
 
     function SequentialTMCMC(
             prior::Vector{<:RandomVariable{<:UnivariateDistribution}},
@@ -463,8 +511,7 @@ struct SequentialTMCMC <: AbstractBayesianMethod
             burnin::Int,
             β::Real = 0.2,
             islog::Bool = true;
-            surrogate::AbstractSurrogateSpec = PCESurrogate(),
-            surrogate_steps::Int = 5,
+            transition::AbstractTransitionMode = SurrogateTransition(),
         )
         if any(nrv_vec .<= 0)
             error("Number of random variables per stage defined by `nrv_vec` must be positive")
@@ -482,11 +529,7 @@ struct SequentialTMCMC <: AbstractBayesianMethod
             error("Factor to compute number of particles `particle_factor` must be positive")
         end
 
-        if surrogate_steps < 0
-            error("Number of surrogate refinement steps `surrogate_steps` must be non-negative")
-        end
-
-        return new(prior, nrv_vec, particle_factor, burnin, β, islog, surrogate, surrogate_steps)
+        return new(prior, nrv_vec, particle_factor, burnin, β, islog, transition)
     end
 end
 
@@ -548,31 +591,45 @@ function bayesianupdating(
             L_curr = stmcmc.islog ? likelihood(θ_curr) : log.(likelihood(θ_curr))
             model_calls += n_curr
 
-            # 3. fit a per-stage surrogate of the log-likelihood and refine the
-            #    particles with a short surrogate-only Markov chain (no forward solves)
-            if stmcmc.surrogate_steps > 0
-                Lhat = _fit_surrogate(stmcmc.surrogate, Matrix(θ_curr[:, rv_names]), L_curr)
-                θ_curr = _surrogate_refine(prior, Lhat, θ_curr, rv_names, stmcmc.surrogate_steps)
-                if !isempty(models)
-                    evaluate!(models, θ_curr)
+            if stmcmc.transition isa SurrogateTransition
+
+                # 3. fit a per-stage surrogate of the log-likelihood and refine the
+                #    particles with a short surrogate-only Markov chain (no forward solves)
+                if stmcmc.transition.surrogate_steps > 0
+                    Lhat = _fit_surrogate(
+                        stmcmc.transition.surrogate, Matrix(θ_curr[:, rv_names]), L_curr
+                    )
+                    θ_curr = _surrogate_refine(
+                        prior, Lhat, θ_curr, rv_names, stmcmc.transition.surrogate_steps
+                    )
+                    if !isempty(models)
+                        evaluate!(models, θ_curr)
+                    end
+                    L_curr = stmcmc.islog ? likelihood(θ_curr) : log.(likelihood(θ_curr))
+                    model_calls += n_curr
                 end
-                L_curr = stmcmc.islog ? likelihood(θ_curr) : log.(likelihood(θ_curr))
-                model_calls += n_curr
+
+                # 4. compute an initial beta > 0 for the current stage from the
+                #    incremental likelihood L_curr - L_old (previous stage at beta = 1)
+                adjust_curr = maximum(L_curr)
+                adjust_old = maximum(L_old)
+                γ, w* = _beta_and_weights(0.0, L_curr .- adjust_curr; extra = L_old .- adjust_old)
+
+                # resample based on the new weights to get the initial samples for the current stage
+                S += log(mean(w*)) + γ * adjust_curr - adjust_old
+                idx = StatsBase.sample(collect(1:n_curr), FrequencyWeights(w* ./ sum(w*)), n_curr; replace = true)
+
+                θ* = θ_curr[idx, :]
+                L* = L_curr[idx]
+                β* = γ
+
+            else    # FreezeUnfreezeTransition: start from beta = 0, freeze old dims until ESS stabilizes
+
+                L* = L_curr
+                θ* = θ_curr
+                β* = 0.0
+
             end
-
-            # 4. compute an initial beta > 0 for the current stage from the
-            #    incremental likelihood L_curr - L_old (previous stage at beta = 1)
-            adjust_curr = maximum(L_curr)
-            adjust_old = maximum(L_old)
-            γ, w* = _beta_and_weights(0.0, L_curr .- adjust_curr; extra = L_old .- adjust_old)
-
-            # resample based on the new weights to get the initial samples for the current stage
-            S += log(mean(w*)) + γ * adjust_curr - adjust_old
-            idx = StatsBase.sample(collect(1:n_curr), FrequencyWeights(w* ./ sum(w*)), n_curr; replace = true)
-
-            θ* = θ_curr[idx, :]
-            L* = L_curr[idx]
-            β* = γ
 
             @info("Finished initialization of stage $(stage), starting with β=$(β*) and S=$(S)!")
         end
@@ -597,7 +654,17 @@ function bayesianupdating(
 
             θ*⁺ = θ*[idx, :]
 
-            Σ* = stmcmc.β^2 * cov(covariance_method, Matrix(θ*⁺[:, rv_names]))
+            # freeze/unfreeze decision based on the ESS of the resampling weights:
+            # while the ESS is low (new dimensions not yet annealed), the MH proposal
+            # only moves the newly added dimensions; once the ESS stabilizes above
+            # the threshold, all active dimensions are unfrozen
+            frozen = false
+            if stage > 1 && stmcmc.transition isa FreezeUnfreezeTransition
+                frozen = _ess(w*) < stmcmc.transition.ess_threshold * n_curr
+            end
+            prop_names = frozen ? rv_names[d_old+1:end] : rv_names
+
+            Σ* = stmcmc.β^2 * cov(covariance_method, Matrix(θ*⁺[:, prop_names]))
 
             U = cholesky(Σ*).U   # factorize once for MvNormal sampler in MH part
 
@@ -616,15 +683,15 @@ function bayesianupdating(
             for i in 2:(stmcmc.burnin + 2)
                 next = copy(chain[i - 1])
 
-                next[:, rv_names] = Matrix(next[:, rv_names]) .+ randn(n_curr, n_rv) * U
+                next[:, prop_names] = Matrix(next[:, prop_names]) .+ randn(n_curr, length(prop_names)) * U
 
                 # safeguard for Inf in the prior
                 idx_inf = findall(isinf, prior(next[:, rv_names]))
 
                 while !isempty(idx_inf)
 
-                    means = Matrix(chain[i - 1][idx_inf, rv_names])
-                    next[idx_inf, rv_names] = means .+ randn(length(idx_inf), n_rv) * U
+                    means = Matrix(chain[i - 1][idx_inf, prop_names])
+                    next[idx_inf, prop_names] = means .+ randn(length(idx_inf), length(prop_names)) * U
 
                     still_inf = isinf.(prior(next[idx_inf, rv_names]))            # only re-check candidates
                     idx_inf = idx_inf[still_inf]

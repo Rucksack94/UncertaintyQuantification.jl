@@ -464,7 +464,10 @@ end
     prior = RandomVariable.(prior_dist, [:x, :y])
 
     for surrogate in (PCESurrogate(), ResponseSurfaceSurrogate(), RadialBasisSurrogate())
-        mh = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; surrogate = surrogate, surrogate_steps = 3)
+        mh = SequentialTMCMC(
+            prior, nrv_vec, particle_factor, burnin;
+            transition = SurrogateTransition(surrogate = surrogate, surrogate_steps = 3),
+        )
         analytic_mean = [-0.5, 0.5]
         analytic_cov = [1 0.8; 0.8 1]
 
@@ -478,5 +481,43 @@ end
         @test ncol(mcmc_samples) == 2
         @test mean(mcmc_samples.x) ≈ analytic_mean[1] rtol = 0.2
         @test mean(mcmc_samples.y) ≈ analytic_mean[2] rtol = 0.2
+    end
+end
+
+@testitem "Bayesian Updating: sequential TMCMC transitions vs full TMCMC" setup = [
+    BayesianUpdating,
+] begin
+    # 2D Gaussian posterior as benchmark, sequential runs use nrv_vec = [1, 2]
+    analytic_mean = [-0.5, 0.5]
+    analytic_cov = [1 0.8; 0.8 1]
+    prior_dist = Uniform(-10, 10)
+    prior = RandomVariable.(prior_dist, [:x, :y])
+
+    logprior(df) = logpdf.(prior_dist, df.x) .+ logpdf.(prior_dist, df.y)
+    loglikelihood(df) = [
+        logpdf(MvNormal(analytic_mean, analytic_cov), collect(x)) for x in eachrow(df)
+    ]
+
+    nrv_vec = [1, 2]
+    particle_factor = 2_000
+    burnin = 5
+
+    seq_surrogate = SequentialTMCMC(
+        prior, nrv_vec, particle_factor, burnin; transition = SurrogateTransition()
+    )
+    seq_freeze = SequentialTMCMC(
+        prior, nrv_vec, particle_factor, burnin; transition = FreezeUnfreezeTransition()
+    )
+    full = TransitionalMarkovChainMonteCarlo(prior, nrv_vec[end] * particle_factor, burnin)
+
+    samples_seq_s, _ = bayesianupdating(logprior, loglikelihood, UQModel[], seq_surrogate)
+    samples_seq_f, _ = bayesianupdating(logprior, loglikelihood, UQModel[], seq_freeze)
+    samples_full, _ = bayesianupdating(logprior, loglikelihood, UQModel[], full)
+
+    for (label, s) in (("surrogate", samples_seq_s), ("freeze-unfreeze", samples_seq_f), ("full TMCMC", samples_full))
+        @test mean(s.x) ≈ analytic_mean[1] rtol = 0.15
+        @test mean(s.y) ≈ analytic_mean[2] rtol = 0.15
+        @test std(s.x) ≈ sqrt(analytic_cov[1, 1]) rtol = 0.2
+        @test std(s.y) ≈ sqrt(analytic_cov[2, 2]) rtol = 0.2
     end
 end

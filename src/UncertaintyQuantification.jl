@@ -165,6 +165,9 @@ export AbstractSurrogateSpec
 export PCESurrogate
 export ResponseSurfaceSurrogate
 export RadialBasisSurrogate
+export AbstractTransitionMode
+export SurrogateTransition
+export FreezeUnfreezeTransition
 export TransportMap
 export TransportMapFromSamples
 export TransportMapBayesian
