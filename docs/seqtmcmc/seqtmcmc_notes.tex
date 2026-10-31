@@ -1,0 +1,202 @@
+% ============================================================================
+%  Notes: Sequential (dimension-growing) TMCMC for inverse problems
+%  Structure:
+%    1. Basics: Bayesian inverse problems + TMCMC
+%    2. Surrogate-transition variant (SequentialTMCMC, default)
+%    3. Freeze/unfreeze variant (ESS-based)
+%  Style: keywords / short sentences, equations numbered, citations as
+%  \cite{...} matching docs/references.bib keys.
+% ============================================================================
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm,algpseudocode}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue]{hyperref}
+
+\newcommand{\bxi}{\boldsymbol{\xi}}          % KL coefficients / parameters
+\newcommand{\bth}{\boldsymbol{\theta}}        % particles
+\newcommand{\bL}{\mathcal{L}}                 % likelihood
+\newcommand{\bpi}{\pi}                        % target density
+\newcommand{\ESS}{\mathrm{ESS}}
+\newcommand{\Ntot}{N}
+
+\title{Sequential TMCMC for random-field reconstruction --- working notes}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+% ============================================================================
+\section{Basics: Bayesian inverse problems and TMCMC}
+% ============================================================================
+
+\subsection{Bayesian inverse problem}
+\begin{itemize}
+  \item Forward model: $y = G(\bxi) + \eta$, noise $\eta \sim \mathcal{N}(0,\sigma^2 I)$.
+  \item Random field parameterized by truncated Karhunen--Loève (KL) expansion:
+    \begin{equation}
+      d(x,\omega) = \bar d(x) + \sum_{i=1}^{T} \xi_i \sqrt{\lambda_i}\,\phi_i(x),
+      \qquad \bxi = (\xi_1,\dots,\xi_T) \sim \mathcal{N}(0, I_T),
+    \end{equation}
+    truncation order $T$ = number of modes; modes ordered by eigenvalue $\lambda_i$.
+  \item Prior: $\bxi \sim \bpi_0 = \mathcal{N}(0,I_T)$; likelihood:
+    \begin{equation}
+      \bL(\bxi) = p(y \mid \bxi) \propto \exp\!\Big(-\tfrac{1}{2\sigma^2}\|y - G(\bxi)\|_2^2\Big).
+    \end{equation}
+  \item Posterior: $\bpi(\bxi) \propto \bL(\bxi)\,\bpi_0(\bxi)$ \cite{stuartInverseProblemsBayesian2010}.
+  \item Posterior contracts mainly in low KL modes (smoothing forward operator) \cite{stuartInverseProblemsBayesian2010} $\Rightarrow$ motivation for mode-by-mode (sequential) inference.
+\end{itemize}
+
+\subsection{TMCMC (tempering)}
+\begin{itemize}
+  \item Tempered sequence of targets \cite{chingTransitionalMarkovChain2007}:
+    \begin{equation}
+      \bpi_k(\bxi) \propto \bpi_0(\bxi)\,\bL(\bxi)^{\beta_k},\qquad 0 = \beta_0 < \beta_1 < \dots < \beta_K = 1.
+    \end{equation}
+  \item Each step: importance weights, resampling, MCMC move (MH) with proposal covariance
+    \begin{equation}
+      \Sigma_k = c^2\,\widehat{\mathrm{Cov}}(\{\bth_k^{(i)}\}),\qquad c = 0.2 \text{ (default)},
+    \end{equation}
+    covariance estimated with linear shrinkage \cite{chingTransitionalMarkovChain2007}.
+  \item Next $\beta$ by bisection so that $\mathrm{CV}(w) \le 1$:
+    \begin{equation}
+      w_i(\beta) = \exp\big((\beta - \beta_{k-1})\,(L_i - \bar L)\big),\qquad
+      \frac{\mathrm{std}(w)}{\mathrm{mean}(w)} \le 1.
+    \end{equation}
+  \item Log-evidence update: $S \mathrel{+}= \log\overline{w} + (\beta_k - \beta_{k-1})\,\bar L$.
+  \item Cost driver: number of forward solves $= \Ntot \times (\text{burn-in} + 2)$ per $\beta$-step.
+\end{itemize}
+
+\begin{algorithm}[ht]
+\caption{TMCMC (single run, fixed dimension $T$)}
+\begin{algorithmic}[1]
+\State sample $\bth_0^{(i)} \sim \bpi_0$, $i = 1..\Ntot$; set $\beta_0 = 0$
+\While{$\beta_k < 1$}
+  \State compute $L_i = \log \bL(\bth_k^{(i)})$ (forward solves)
+  \State bisect $\beta_{k+1} > \beta_k$ s.t.\ $\mathrm{CV}(w) \le 1$, $w_i = \bL_i^{\beta_{k+1}-\beta_k}$
+  \State resample $\bth_k^{(i)}$ with weights $w_i$ $\rightarrow$ $\bth_k^{(i)*}$
+  \State MH steps ($\text{burn-in}+1$) targeting $\bpi_0\,\bL^{\beta_{k+1}}$, proposal $\mathcal{N}(\bth, \Sigma_k)$
+  \State $\bth_{k+1} \leftarrow$ final MH states; $\beta_{k+1} \leftarrow \beta_{k+1}$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{SMC view (why sequential = SMC sampler)}
+\begin{itemize}
+  \item TMCMC is an SMC sampler on the $\beta$-path \cite{delMoralSequentialMonteCarlo2006}.
+  \item Sequential version: SMC sampler on a \emph{model-continuation path} indexed by truncation order $T_s$:
+    \begin{equation}
+      \bpi^{(s)}(\bxi_{1:T_s}) \propto \bpi_0(\bxi_{1:T_s})\,\bL(\bxi_{1:T_s}),\qquad T_1 < T_2 < \dots < T_S = T.
+    \end{equation}
+  \item Analogy: subset simulation bridges prior $\rightarrow$ posterior via nested sets \cite{auEstimationSmallFailure2001}; here the bridge is soft (tempering / model growth) instead of hard conditioning.
+\end{itemize}
+
+% ============================================================================
+\section{Variant A: surrogate-guided transition (SequentialTMCMC default)}
+% ============================================================================
+
+\subsection{Idea}
+\begin{itemize}
+  \item Stages $s = 1..S$, stage $s$ uses first $T_s = $ \texttt{nrv\_vec[s]} modes, $\Ntot_s = T_s \cdot$ \texttt{particle\_factor}.
+  \item Stage 1: standard TMCMC from prior at $\beta = 0$.
+  \item Stage $s \ge 2$: warm start from stage $s-1$; all active dims remain free in the MH proposal (old dims \emph{can} move).
+\end{itemize}
+
+\subsection{Transition step at stage $s \ge 2$}
+\begin{enumerate}
+  \item \textbf{Weighted resampling} of previous particles with final posterior weights (no new LL evals):
+    \begin{equation}
+      w_i^{\mathrm{old}} = \exp(L_i^{(s-1)} - \max_j L_j^{(s-1)}),\qquad
+      \bth^{\mathrm{old}} \leftarrow \mathrm{resample}(\bth^{(s-1)}, w^{\mathrm{old}}, \Ntot_s).
+    \end{equation}
+  \item \textbf{Prior injection} of new dims + one exact likelihood evaluation:
+    \begin{equation}
+      \bxi_{T_{s-1}+1:T_s} \sim \bpi_0,\qquad
+      \bth^{\mathrm{curr}} = [\bth^{\mathrm{old}},\ \bxi_{\mathrm{new}}],\qquad
+      L^{\mathrm{curr}} = \log\bL(\bth^{\mathrm{curr}}).
+    \end{equation}
+  \item \textbf{Per-stage surrogate} of the log-likelihood, fitted to $(\bth^{\mathrm{curr}}, L^{\mathrm{curr}})$:
+    \begin{itemize}
+      \item default: PCE with Hermite basis (matched to $\mathcal{N}(0,I)$ prior) \cite{wienerHeterogeneousChaos1938},
+        \begin{equation}
+          \hat L(\bxi) = \sum_{\alpha \in \mathcal{A}_p} c_\alpha \Psi_\alpha(\bxi),\qquad
+          \Psi_\alpha(\bxi) = \prod_{j} He_{\alpha_j}(\xi_j),
+        \end{equation}
+        total-degree index set $\mathcal{A}_p$, order $p = 3$; alternatives: monomial response surface, Gaussian RBF.
+      \item short MH chain on the surrogate target $\bpi_0\,\hat L$ (zero forward solves) $\rightarrow$ refined particles, then one exact re-evaluation.
+    \end{itemize}
+  \item \textbf{Initial $\beta > 0$ from the incremental likelihood} (previous stage already at $\beta = 1$):
+    \begin{equation}
+      w_i(\gamma) = \exp\big(\gamma\,(L_i^{\mathrm{curr}} - \bar L^{\mathrm{curr}}) - (L_i^{\mathrm{old}} - \bar L^{\mathrm{old}})\big),
+    \end{equation}
+    bisect $\gamma$ s.t.\ $\mathrm{CV}(w) \le 1$; resample once; $S \mathrel{+}= \log\overline{w} + \gamma\bar L^{\mathrm{curr}} - \bar L^{\mathrm{old}}$; start stage at $\beta_s = \gamma$.
+\end{enumerate}
+
+\subsection{Cost model}
+\begin{itemize}
+  \item Transition costs $\Ntot_s$ (injection eval) $+ \Ntot_s$ (post-refinement eval) forward solves, paid once per stage.
+  \item Inner $\beta$-loop: $\Ntot_s(\text{burn-in}+2)$ solves per step --- same as standard TMCMC, single LL eval per MH step.
+  \item Surrogate MCMC: zero forward solves.
+\end{itemize}
+
+\begin{algorithm}[ht]
+\caption{SequentialTMCMC with \texttt{SurrogateTransition} (stage $s \ge 2$ transition)}
+\begin{algorithmic}[1]
+\State resample previous particles with final weights $w^{\mathrm{old}}$ to $\Ntot_s$ particles
+\State append prior draws for $\bxi_{T_{s-1}+1:T_s}$; evaluate exact $L^{\mathrm{curr}}$
+\State fit PCE surrogate $\hat L$ on $(\bth^{\mathrm{curr}}, L^{\mathrm{curr}})$; run short surrogate-only MH; re-evaluate $L^{\mathrm{curr}}$ exactly
+\State bisect initial $\gamma$ on incremental weights $w(\gamma) = \exp(\gamma L^{\mathrm{curr}} - L^{\mathrm{old}})$; resample; set $\beta_s = \gamma$
+\State run standard TMCMC inner loop on $\bpi_0\,\bL^{\beta}$ from $\beta_s$ up to $1$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================================
+\section{Variant B: ESS-based freeze/unfreeze transition}
+% ============================================================================
+
+\subsection{Idea}
+\begin{itemize}
+  \item Same stage structure, but no surrogate and no initial-$\beta$ bisection: start stage $s \ge 2$ at $\beta_s = 0$.
+  \item While the new dims are not yet annealed, moving the old (well-fitted) dims adds little and risks dragging particles out of the good region $\Rightarrow$ freeze old dims in the MH proposal.
+  \item Unfreeze decision based on the \textbf{ESS of the resampling weights} (not on a heuristic $\beta$ value):
+    \begin{equation}
+      \ESS(w) = \frac{1}{\sum_i (w_i/\sum_j w_j)^2},\qquad
+      \text{frozen} \;\Leftrightarrow\; \ESS(w) < \tau \cdot \Ntot_s,\quad \tau = 0.5 \text{ (default)}.
+    \end{equation}
+  \item Frozen: proposal only on new dims $\bxi_{T_{s-1}+1:T_s}$, covariance from those dims only; unfrozen: all $T_s$ active dims.
+\end{itemize}
+
+\subsection{Cost model}
+\begin{itemize}
+  \item Single likelihood evaluation per MH step in every stage (no second $L^{\mathrm{old}}$ eval, no surrogate refit).
+  \item Transition costs only $\Ntot_s$ solves (prior injection eval).
+\end{itemize}
+
+\begin{algorithm}[ht]
+\caption{SequentialTMCMC with \texttt{FreezeUnfreezeTransition} (inner loop of stage $s \ge 2$)}
+\begin{algorithmic}[1]
+\State resample previous particles with final weights; append prior draws; evaluate $L^{\mathrm{curr}}$ once; set $\beta_s = 0$
+\While{$\beta_s < 1$}
+  \State bisect $\beta_s^{+} > \beta_s$ from weights $w = \bL^{\beta_s^{+}-\beta_s}$; resample
+  \State $\mathrm{frozen} = (\ESS(w) < \tau\,\Ntot_s)$ and $s \ge 2$
+  \State proposal dims: new dims only if frozen, else all active dims; $\Sigma = c^2\widehat{\mathrm{Cov}}$ over proposal dims
+  \State MH steps targeting $\bpi_0\,\bL^{\beta_s^{+}}$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================================
+\section{Comparison / benchmark setup}
+% ============================================================================
+\begin{itemize}
+  \item Benchmark: 2D advection--diffusion, reconstruct diffusion field (KL modes, $T = 30$, stages $T_s = 5,10,\dots,30$) and velocity $(v_x, v_y)$ with fixed diffusion.
+  \item Metrics per method: wall time, number of forward solves, log-evidence, MRMS of reconstructed field/solution vs.\ reference.
+  \item Compared: Variant A, Variant B, full TMCMC at final dimension.
+  \item Tests: 2D Gaussian posterior vs.\ analytic mean/cov for both variants and full TMCMC.
+\end{itemize}
+
+\bibliographystyle{plain}
+\bibliography{../references}
+
+\end{document}
