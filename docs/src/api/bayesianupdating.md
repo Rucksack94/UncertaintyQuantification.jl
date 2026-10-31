@@ -14,6 +14,11 @@ Pages = ["bayesianupdating.md"]
 AbstractBayesianMethod
 SingleComponentMetropolisHastings
 TransitionalMarkovChainMonteCarlo
+SequentialTMCMC
+AbstractSurrogateSpec
+PCESurrogate
+ResponseSurfaceSurrogate
+RadialBasisSurrogate
 AbstractBayesianPointEstimate
 MaximumAPosterioriBayesian
 MaximumLikelihoodBayesian

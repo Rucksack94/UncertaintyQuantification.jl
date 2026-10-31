@@ -173,9 +173,11 @@ end
 plot(p...,layout=(2,3),size=(1000,500))
 
 ## define forward model
-ic = Vector(u_noise[:,1]) 
+ic = Vector(u_noise[:,1])
+model_calls = Ref(0)
 function eval_ad_model(df::DataFrame)
     n = nrow(df)        # number of particles
+    model_calls[] += n
     pnames = names(df, x -> x[1] == 'ξ')
     evals = [spzeros(nx*ny, n_out+1) for _ in 1:n]
 
@@ -217,35 +219,42 @@ function loglikelihood(df)
             log_ll[n] = -0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2)
         end
     end
-    #log_ll[isnan.(log_ll)] .= minimum(log_ll[.!isnan.(log_ll)]) / 10
     log_ll[isnan.(log_ll)] .= -1e2
     return log_ll
-    #return [-0.5 * sum(((u_noise .- evals[n]) ./ σ_noise) .^ 2) for n in eachindex(evals)]
 end
 
 prior = RandomVariable.(Normal(), [Symbol("ξ$(i)") for i in 1:T_reco])
 
 nrv_vec = [5:5:T_reco;]
-#nrv_vec = [5:5:10;]
 particle_factor = 10
 burnin = 2
-seqtmcmc = SequentialTransitionalMarkovChainMonteCarlo(prior, nrv_vec, particle_factor, burnin)
+seqtmcmc = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin)
 
-# eval SeqTMCMC (model_calls = 79650)
-stmcmc_samples, stmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], seqtmcmc);
+# eval SeqTMCMC
+model_calls[] = 0
+t_seq = @elapsed stmcmc_samples, stmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], seqtmcmc);
+ncalls_seq = model_calls[]
 final_coefs_seq = Matrix(stmcmc_samples[:,names(prior)]) ;
 s_reco_seq = vec(sum(final_coefs_seq, dims=1)./size(final_coefs_seq,1));
 d_reco_seq = sample_d(s_reco_seq);
 u_reco_seq = forward_solve_imex(d_reco_seq, u0, vx, vy, adp, dt, nsteps, n_out);
 
-# eval TMCMC (model_calls = 45300)
+# eval TMCMC
 ntmcmc = nrv_vec[end] * particle_factor;
 tmcmc = TransitionalMarkovChainMonteCarlo(prior, ntmcmc, burnin);
-tmcmc_samples, tmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], tmcmc);
+model_calls[] = 0
+t_tmcmc = @elapsed tmcmc_samples, tmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], tmcmc);
+ncalls_tmcmc = model_calls[]
 final_coefs = Matrix(tmcmc_samples[:,names(prior)]) ;
 s_reco = vec(sum(final_coefs, dims=1)./size(final_coefs,1));
 d_reco = sample_d(s_reco);
 u_reco = forward_solve_imex(d_reco, u0, vx, vy, adp, dt, nsteps, n_out);
+
+# benchmark: runtime, forward solves, evidence
+println("=== Random-field (diffusion) reconstruction benchmark ===")
+println("method   | time [s] | forward solves | log-evidence")
+println("SeqTMCMC | $(round(t_seq, digits=1)) | $ncalls_seq | $(round(stmcmc_evidence, digits=2))")
+println("TMCMC    | $(round(t_tmcmc, digits=1)) | $ncalls_tmcmc | $(round(tmcmc_evidence, digits=2))")
 
 # compute low order reference
 s_ref_low = (grf.data.eigenfunc[:, 1:T_reco] * Diagonal(grf.data.eigenval[1:T_reco])) \ log.(d_ref ./ 0.1);
@@ -294,3 +303,62 @@ anim = @animate for frame in axes(u_ref,2)
 end
 gif(anim, fps=2)
 
+
+## ---------------------------------------------------------------------------
+## Second example: reconstruct the advection velocity (vx, vy) with fixed diffusion field
+d_fixed = d_ref   # known diffusion field
+u_vel_ref = forward_solve_imex(d_fixed, u0, vx, vy, adp, dt, nsteps, n_out)
+u_vel_noise = max.(u_vel_ref .+ randn(size(u_vel_ref)) .* σ_noise, 0.0)
+
+model_calls_vel = Ref(0)
+function eval_ad_vel_model(df::DataFrame)
+    n = nrow(df)
+    model_calls_vel[] += n
+    evals = [spzeros(nx*ny, n_out+1) for _ in 1:n]
+    for i in 1:n
+        u_curr = forward_solve_imex(d_fixed, ic, df.vx[i], df.vy[i], adp, dt, nsteps, n_out)
+        refine_count = 0
+        while (refine_count < 3) && (minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr))
+            refine_count += 1
+            u_curr = forward_solve_imex(d_fixed, ic, df.vx[i], df.vy[i], adp, dt/(5^refine_count), nsteps*(5^refine_count), n_out)
+        end
+        if minimum(u_curr) < -0.1 || 2.2 < maximum(u_curr)
+            u_curr .= NaN
+        end
+        evals[i] = u_curr
+    end
+    return evals
+end
+ad_vel_model = Model(eval_ad_vel_model, :AdvDiffVel)
+
+function loglikelihood_vel(df)
+    evals = df.AdvDiffVel
+    log_ll = zeros(length(evals))
+    for n in eachindex(evals)
+        if any(isnan.(evals[n]))
+            log_ll[n] = -1e2
+        else
+            log_ll[n] = -0.5 * sum(((u_vel_noise .- evals[n]) ./ σ_noise) .^ 2)
+        end
+    end
+    return log_ll
+end
+
+prior_vel = RandomVariable.(Normal(0.0, 2.0), [:vx, :vy])
+nrv_vec_vel = [1, 2]
+
+seq_vel = SequentialTMCMC(prior_vel, nrv_vec_vel, 200, 5)
+model_calls_vel[] = 0
+t_seq_vel = @elapsed vel_samples_seq, vel_evidence_seq = bayesianupdating(loglikelihood_vel, [ad_vel_model], seq_vel);
+ncalls_seq_vel = model_calls_vel[]
+
+tmcmc_vel = TransitionalMarkovChainMonteCarlo(prior_vel, 2*200, 5)
+model_calls_vel[] = 0
+t_tmcmc_vel = @elapsed vel_samples_tmcmc, vel_evidence_tmcmc = bayesianupdating(loglikelihood_vel, [ad_vel_model], tmcmc_vel);
+ncalls_tmcmc_vel = model_calls_vel[]
+
+println("=== Velocity reconstruction benchmark ===")
+println("method   | time [s] | forward solves | log-evidence | mean vx | mean vy")
+println("SeqTMCMC | $(round(t_seq_vel, digits=2)) | $ncalls_seq_vel | $(round(vel_evidence_seq, digits=2)) | $(round(mean(vel_samples_seq.vx), digits=3)) | $(round(mean(vel_samples_seq.vy), digits=3))")
+println("TMCMC    | $(round(t_tmcmc_vel, digits=2)) | $ncalls_tmcmc_vel | $(round(vel_evidence_tmcmc, digits=2)) | $(round(mean(vel_samples_tmcmc.vx), digits=3)) | $(round(mean(vel_samples_tmcmc.vy), digits=3))")
+println("reference: vx = $vx, vy = $vy")

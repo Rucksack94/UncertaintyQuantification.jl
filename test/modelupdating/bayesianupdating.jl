@@ -354,7 +354,7 @@ end
 
     prior_sample_ = RandomVariable(prior, :x)
 
-    seqtmcmc = SequentialTransitionalMarkovChainMonteCarlo([prior_sample_], nrv_vec, particle_factor, burnin)
+    seqtmcmc = SequentialTMCMC([prior_sample_], nrv_vec, particle_factor, burnin)
 
     mc_samples, analytic_mean, analytic_std = binomialinferencebenchmark(seqtmcmc, prior)
 
@@ -374,7 +374,7 @@ end
 
     prior_sample_ = RandomVariable(prior, :x)
 
-    seqtmcmc = SequentialTransitionalMarkovChainMonteCarlo([prior_sample_], nrv_vec, particle_factor, burnin)
+    seqtmcmc = SequentialTMCMC([prior_sample_], nrv_vec, particle_factor, burnin)
 
     mc_samples, analytic_mean, analytic_std = normalmeanbenchmark(seqtmcmc, prior)
 
@@ -394,7 +394,7 @@ end
 
     prior_sample_ = RandomVariable(prior, :x)
 
-    seqtmcmc = SequentialTransitionalMarkovChainMonteCarlo([prior_sample_], nrv_vec, particle_factor, burnin)
+    seqtmcmc = SequentialTMCMC([prior_sample_], nrv_vec, particle_factor, burnin)
 
     mc_samples, analytic_mean, analytic_std = normalvarbenchmark(seqtmcmc, prior)
 
@@ -411,7 +411,7 @@ end
 
     prior = RandomVariable.(prior_dist, [:x, :y])
 
-    mh = SequentialTransitionalMarkovChainMonteCarlo([prior_sample_], nrv_vec, particle_factor, burnin)
+    mh = SequentialTMCMC([prior_sample_], nrv_vec, particle_factor, burnin)
     mcmc_samples, analytic_mean, analytic_cov = bivariategaussian(mh, prior_dist)
 
     @test mean(mcmc_samples.x) ≈ analytic_mean[1] rtol = 0.1
@@ -424,4 +424,59 @@ end
     @test std(mcmc_samples.x) ≈ analytic_std_1 rtol = 0.1
     @test std(mcmc_samples.y) ≈ analytic_std_2 rtol = 0.1
     @test cor(mcmc_samples.x, mcmc_samples.y) ≈ analytic_cor rtol = 0.1
+end
+
+@testitem "Bayesian Updating: sequential TMCMC multi-stage bivariategaussian" setup = [
+    BayesianUpdating,
+] begin
+    nrv_vec = [1, 2]
+    particle_factor = 2_000
+    burnin = 5
+
+    prior_dist = Uniform(-10, 10)
+
+    prior = RandomVariable.(prior_dist, [:x, :y])
+
+    mh = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin)
+    mcmc_samples, analytic_mean, analytic_cov = bivariategaussian(mh, prior_dist)
+
+    @test ncol(mcmc_samples) == 2
+    @test mean(mcmc_samples.x) ≈ analytic_mean[1] rtol = 0.15
+    @test mean(mcmc_samples.y) ≈ analytic_mean[2] rtol = 0.15
+
+    analytic_std_1 = sqrt(analytic_cov[1, 1])
+    analytic_std_2 = sqrt(analytic_cov[2, 2])
+    analytic_cor = analytic_cov[1, 2] / (analytic_std_1 * analytic_std_2)
+
+    @test std(mcmc_samples.x) ≈ analytic_std_1 rtol = 0.15
+    @test std(mcmc_samples.y) ≈ analytic_std_2 rtol = 0.15
+    @test cor(mcmc_samples.x, mcmc_samples.y) ≈ analytic_cor rtol = 0.3
+end
+
+@testitem "Bayesian Updating: sequential TMCMC surrogate variants" setup = [
+    BayesianUpdating,
+] begin
+    nrv_vec = [1, 2]
+    particle_factor = 500
+    burnin = 3
+
+    prior_dist = Normal()
+    prior = RandomVariable.(prior_dist, [:x, :y])
+
+    for surrogate in (PCESurrogate(), ResponseSurfaceSurrogate(), RadialBasisSurrogate())
+        mh = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; surrogate = surrogate, surrogate_steps = 3)
+        analytic_mean = [-0.5, 0.5]
+        analytic_cov = [1 0.8; 0.8 1]
+
+        logprior(df) = logpdf.(prior_dist, df.x) .+ logpdf.(prior_dist, df.y)
+        loglikelihood(df) = [
+            logpdf(MvNormal(analytic_mean, analytic_cov), collect(x)) for x in eachrow(df)
+        ]
+
+        mcmc_samples, _ = bayesianupdating(logprior, loglikelihood, UQModel[], mh)
+
+        @test ncol(mcmc_samples) == 2
+        @test mean(mcmc_samples.x) ≈ analytic_mean[1] rtol = 0.2
+        @test mean(mcmc_samples.y) ≈ analytic_mean[2] rtol = 0.2
+    end
 end
