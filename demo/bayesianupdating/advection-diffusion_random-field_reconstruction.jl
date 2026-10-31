@@ -230,10 +230,20 @@ particle_factor = 10
 burnin = 2
 seqtmcmc = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin)
 
-# eval SeqTMCMC
+# eval SeqTMCMC (surrogate transition)
 model_calls[] = 0
 t_seq = @elapsed stmcmc_samples, stmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], seqtmcmc);
 ncalls_seq = model_calls[]
+
+# eval SeqTMCMC (freeze/unfreeze transition)
+seqtmcmc_freeze = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; transition = FreezeUnfreezeTransition())
+model_calls[] = 0
+t_seq_freeze = @elapsed stmcmc_samples_freeze, stmcmc_evidence_freeze = bayesianupdating(loglikelihood, [ad_model], seqtmcmc_freeze);
+ncalls_seq_freeze = model_calls[]
+final_coefs_seq_freeze = Matrix(stmcmc_samples_freeze[:,names(prior)]);
+s_reco_seq_freeze = vec(sum(final_coefs_seq_freeze, dims=1)./size(final_coefs_seq_freeze,1));
+d_reco_seq_freeze = sample_d(s_reco_seq_freeze);
+u_reco_seq_freeze = forward_solve_imex(d_reco_seq_freeze, u0, vx, vy, adp, dt, nsteps, n_out);
 final_coefs_seq = Matrix(stmcmc_samples[:,names(prior)]) ;
 s_reco_seq = vec(sum(final_coefs_seq, dims=1)./size(final_coefs_seq,1));
 d_reco_seq = sample_d(s_reco_seq);
@@ -250,15 +260,25 @@ s_reco = vec(sum(final_coefs, dims=1)./size(final_coefs,1));
 d_reco = sample_d(s_reco);
 u_reco = forward_solve_imex(d_reco, u0, vx, vy, adp, dt, nsteps, n_out);
 
-# benchmark: runtime, forward solves, evidence
-println("=== Random-field (diffusion) reconstruction benchmark ===")
-println("method   | time [s] | forward solves | log-evidence")
-println("SeqTMCMC | $(round(t_seq, digits=1)) | $ncalls_seq | $(round(stmcmc_evidence, digits=2))")
-println("TMCMC    | $(round(t_tmcmc, digits=1)) | $ncalls_tmcmc | $(round(tmcmc_evidence, digits=2))")
-
 # compute low order reference
 s_ref_low = (grf.data.eigenfunc[:, 1:T_reco] * Diagonal(grf.data.eigenval[1:T_reco])) \ log.(d_ref ./ 0.1);
 d_ref_low = sample_d(s_ref_low);
+
+# Mixed Root Mean Square (MRMS) error
+mrms(ref,approx) = sqrt(sum( ((ref .- approx)/(1.0 .+ abs.(ref))).^2 )/prod(size(ref))) ;
+d_mrms_seq = mrms(d_reco_seq,d_ref_low) ;
+d_mrms = mrms(d_reco,d_ref_low);
+u_true_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_ref)) ;
+u_true_mrms = mrms(Matrix(u_reco),Matrix(u_ref));
+d_mrms_seq_freeze = mrms(d_reco_seq_freeze,d_ref_low);
+u_true_mrms_seq_freeze = mrms(Matrix(u_reco_seq_freeze),Matrix(u_ref));
+
+# benchmark: runtime, forward solves, evidence
+println("=== Random-field (diffusion) reconstruction benchmark ===")
+println("method                | time [s] | forward solves | log-evidence | MRMS(d) | MRMS(u,u_ref)")
+println("SeqTMCMC surrogate    | $(round(t_seq, digits=1)) | $ncalls_seq | $(round(stmcmc_evidence, digits=2)) | $(round(d_mrms_seq*100,digits=3))% | $(round(u_true_mrms_seq*100,digits=3))%")
+println("SeqTMCMC freeze/unfr. | $(round(t_seq_freeze, digits=1)) | $ncalls_seq_freeze | $(round(stmcmc_evidence_freeze, digits=2)) | $(round(d_mrms_seq_freeze*100,digits=3))% | $(round(u_true_mrms_seq_freeze*100,digits=3))%")
+println("TMCMC                 | $(round(t_tmcmc, digits=1)) | $ncalls_tmcmc | $(round(tmcmc_evidence, digits=2)) | $(round(d_mrms*100,digits=3))% | $(round(u_true_mrms*100,digits=3))%")
 
 # Boxplot RF coefficients
 final_coefs_seq .-= s_ref_low[1:T_reco]' 
@@ -270,12 +290,7 @@ StatsPlots.boxplot!(bp,repeat(1:T_reco, inner=size(final_coefs,1)), vec(final_co
 plot!(bp,size=(800,500),guidefontsize=16,tickfontsize=14,legendfontsize=16,xticks=nrv_vec)
 
 
-# Mixed Root Mean Square (MRMS) error
-mrms(ref,approx) = sqrt(sum( ((ref .- approx)/(1.0 .+ abs.(ref))).^2 )/prod(size(ref))) ;
-d_mrms_seq = mrms(d_reco_seq,d_ref_low) ;
-d_mrms = mrms(d_reco,d_ref_low);
-u_true_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_ref)) ;
-u_true_mrms = mrms(Matrix(u_reco),Matrix(u_ref));
+# remaining MRMS quantities
 u_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_noise)) ;
 u_mrms = mrms(Matrix(u_reco),Matrix(u_noise));
 ulocal_true_mrms_seq = mrms.(Matrix(u_reco_seq),Matrix(u_ref)) ;

@@ -19,6 +19,9 @@ AbstractSurrogateSpec
 PCESurrogate
 ResponseSurfaceSurrogate
 RadialBasisSurrogate
+AbstractTransitionMode
+SurrogateTransition
+FreezeUnfreezeTransition
 AbstractBayesianPointEstimate
 MaximumAPosterioriBayesian
 MaximumLikelihoodBayesian
