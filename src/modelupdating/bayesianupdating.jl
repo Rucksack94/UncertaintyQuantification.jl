@@ -410,9 +410,9 @@ function _surrogate_refine(
         prop[:, rv_names] = Matrix(prop[:, rv_names]) .+ randn(n, d) .* sd'
         lp = logtarget(prop)
         accept = min.(0.0, lp .- cur) .>= log.(rand(n))
-        Xc = Matrix(θ[:, rv_names])
-        Xc[accept, :] = Matrix(prop[:, rv_names])[accept, :]
-        θ[:, rv_names] = Xc
+        for i in findall(accept)
+            θ[i, rv_names] = prop[i, rv_names]
+        end
         cur[accept] .= lp[accept]
     end
     return θ
