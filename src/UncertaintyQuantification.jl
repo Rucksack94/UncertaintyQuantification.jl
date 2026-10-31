@@ -64,6 +64,7 @@ Subtypes are:
 
 - [`SingleComponentMetropolisHastings`](@ref)
 - [`TransitionalMarkovChainMonteCarlo`](@ref)
+- [`SequentialTMCMC`](@ref)
 """
 abstract type AbstractBayesianMethod end
 
@@ -159,6 +160,11 @@ export SubSetInfinity
 export SubSetInfinityAdaptive
 export SubSetSimulation
 export TransitionalMarkovChainMonteCarlo
+export SequentialTMCMC
+export AbstractSurrogateSpec
+export PCESurrogate
+export ResponseSurfaceSurrogate
+export RadialBasisSurrogate
 export TransportMap
 export TransportMapFromSamples
 export TransportMapBayesian
