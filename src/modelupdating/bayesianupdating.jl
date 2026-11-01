@@ -501,8 +501,8 @@ function bayesianupdating(
     covariance_method = LinearShrinkage(DiagonalUnitVariance(), :lw)
     S = 0.0
     model_calls = 0
-    θstar = DataFrame()
-    Lstar = Vector{Float64}()
+    θ˟ = DataFrame()
+    L˟ = Vector{Float64}()
     n_old = 0    # number of particles of the previous stage
     d_old = 0    # number of random variables of the previous stage
 
@@ -520,23 +520,23 @@ function bayesianupdating(
         # for stage 1 additional initialization (same as TMCMC)
         if stage == 1
 
-            betastar = 0.0                                    # tempering
+            β˟ = 0.0                                    # tempering
 
-            θstar = sample(stmcmc.prior[1:n_rv], n_curr)   # prior samples
+            θ˟ = sample(stmcmc.prior[1:n_rv], n_curr)   # prior samples
 
             # eval forward model if supplied
             if !isempty(models)
-                evaluate!(models, θstar)
+                evaluate!(models, θ˟)
             end
 
         else    # for stage >= 2 use previous results for initialization
 
             # 1. weighted resampling of the previous stage's particles using their
             #    final (beta = 1) posterior weights - no new likelihood evaluations
-            w_old = exp.(Lstar .- maximum(Lstar))
+            w_old = exp.(L˟ .- maximum(L˟))
             idx_resample = StatsBase.sample(collect(1:n_old), FrequencyWeights(w_old), n_curr; replace = true)
-            θ_old = θstar[idx_resample, :]
-            L_old = Lstar[idx_resample]
+            θ_old = θ˟[idx_resample, :]
+            L_old = L˟[idx_resample]
 
             # 2. initialize the newly added dimensions from the prior and evaluate once
             θ_new = sample(stmcmc.prior[d_old+1:n_rv], n_curr)
@@ -564,53 +564,53 @@ function bayesianupdating(
             #    incremental likelihood L_curr - L_old (previous stage at beta = 1)
             adjust_curr = maximum(L_curr)
             adjust_old = maximum(L_old)
-            γ, wstar = _beta_and_weights(0.0, L_curr .- adjust_curr; extra = L_old .- adjust_old)
+            γ, w˟ = _beta_and_weights(0.0, L_curr .- adjust_curr; extra = L_old .- adjust_old)
 
             # resample based on the new weights to get the initial samples for the current stage
-            S += log(mean(wstar)) + γ * adjust_curr - adjust_old
-            idx = StatsBase.sample(collect(1:n_curr), FrequencyWeights(wstar ./ sum(wstar)), n_curr; replace = true)
+            S += log(mean(w˟)) + γ * adjust_curr - adjust_old
+            idx = StatsBase.sample(collect(1:n_curr), FrequencyWeights(w˟ ./ sum(w˟)), n_curr; replace = true)
 
-            θstar = θ_curr[idx, :]
-            Lstar = L_curr[idx]
-            betastar = γ
+            θ˟ = θ_curr[idx, :]
+            L˟ = L_curr[idx]
+            β˟ = γ
 
-            @info("Finished initialization of stage $(stage), starting with β=$(betastar) and S=$(S)!")
+            @info("Finished initialization of stage $(stage), starting with β=$(β˟) and S=$(S)!")
         end
 
         # inner β loop
-        while betastar < 1
+        while β˟ < 1
             j += 1
 
-            likelihood_j = stmcmc.islog ? likelihood(θstar) : log.(likelihood(θstar))
+            likelihood_j = stmcmc.islog ? likelihood(θ˟) : log.(likelihood(θ˟))
 
             adjust = Distributions.maximum(likelihood_j)
 
-            betastar_next, wstar = _beta_and_weights(betastar, likelihood_j .- adjust)
+            β˟⁺, w˟ = _beta_and_weights(β˟, likelihood_j .- adjust)
 
-            @debug "betastar" betastar_next
+            @debug "β˟" β˟⁺
 
-            S += (log(mean(wstar)) + (betastar_next - betastar) * adjust)
+            S += (log(mean(w˟)) + (β˟⁺ - β˟) * adjust)
 
-            weights = FrequencyWeights(wstar ./ sum(wstar))
+            weights = FrequencyWeights(w˟ ./ sum(w˟))
 
             idx = StatsBase.sample(collect(1:(n_curr)), weights, n_curr; replace=true)
 
-            θstar_next = θstar[idx, :]
+            θ˟⁺ = θ˟[idx, :]
 
-            Sigmastar = stmcmc.β^2 * cov(covariance_method, Matrix(θstar_next[:, rv_names]))
+            Σ˟ = stmcmc.β^2 * cov(covariance_method, Matrix(θ˟⁺[:, rv_names]))
 
-            U = cholesky(Sigmastar).U   # factorize once for MvNormal sampler in MH part
+            U = cholesky(Σ˟).U   # factorize once for MvNormal sampler in MH part
 
             # Run inner MH algorithm
 
             chain = Vector{DataFrame}(undef, stmcmc.burnin + 2)
 
-            chain[1] = copy(θstar_next)
+            chain[1] = copy(θ˟⁺)
 
             target = if stmcmc.islog
-                df -> likelihood(df) .* betastar_next .+ prior(df[:,rv_names])
+                df -> likelihood(df) .* β˟⁺ .+ prior(df[:,rv_names])
             else
-                df -> log.(likelihood(df)) .* betastar_next .+ log.(prior(df[:,rv_names]))
+                df -> log.(likelihood(df)) .* β˟⁺ .+ log.(prior(df[:,rv_names]))
             end
 
             for i in 2:(stmcmc.burnin + 2)
@@ -645,15 +645,15 @@ function bayesianupdating(
                 chain[i] = next
             end
 
-            θstar_next = chain[end]
+            θ˟⁺ = chain[end]
 
-            betastar = betastar_next
-            θstar = θstar_next
+            β˟ = β˟⁺
+            θ˟ = θ˟⁺
 
         end # β loop
 
         # store final likelihoods of the stage for the weighted resampling of the next stage
-        Lstar = stmcmc.islog ? likelihood(θstar) : log.(likelihood(θstar))
+        L˟ = stmcmc.islog ? likelihood(θ˟) : log.(likelihood(θ˟))
 
         model_calls += n_curr * (1 + j * (1 + stmcmc.burnin))
         n_old = n_curr
@@ -663,7 +663,7 @@ function bayesianupdating(
 
     @debug "Model Calls" model_calls
 
-    return θstar, S
+    return θ˟, S
 end
 
 function bayesianupdating(
