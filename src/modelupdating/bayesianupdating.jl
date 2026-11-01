@@ -323,6 +323,7 @@ abstract type AbstractSurrogateSpec end
     PCESurrogate(; p = 3, index_set = :TD)
 
 Polynomial chaos expansion surrogate with Hermite basis (matched to standard normal priors), total degree `p` and multi-index set `index_set` (`:TD`, `:TP` or `:HC`). Used as default surrogate in [`SequentialTMCMC`](@ref).
+index_set options: 1) :TD = :total_degree, 2) :TP = :total_product, 3) :HC = :hyperbolic_cross
 """
 struct PCESurrogate <: AbstractSurrogateSpec
     p::Int
@@ -432,9 +433,11 @@ function _fit_surrogate(spec::ResponseSurfaceSurrogate, X::Matrix{<:Real}, y::Ve
 end
 
 function _fit_surrogate(spec::RadialBasisSurrogate, X::Matrix{<:Real}, y::Vector{<:Real})
+    # get parameters
     inputs = _surrogate_input_names(size(X, 2))
     df = DataFrame(X, inputs)
     df.L = y
+    
     rbf = LinearBasisFunctionModel(df, :L, GaussianRadialBasis(copy(X'), spec.ε), inputs)
     return ξ -> begin
         d = DataFrame(reshape(collect(ξ), 1, :), inputs)
@@ -444,23 +447,29 @@ function _fit_surrogate(spec::RadialBasisSurrogate, X::Matrix{<:Real}, y::Vector
 end
 
 function _surrogate_refine(
-        prior::Function, Lhat::Function, θ0::DataFrame, rv_names::Vector{Symbol}, n_steps::Int
+        log_prior::Function, loglikeli_hat::Function, θ_init::DataFrame, rv_names::Vector{Symbol}, n_steps::Int
     )
-    n = nrow(θ0)
+    # get parameters
+    n = nrow(θ_init)
     d = length(rv_names)
-    θ = copy(θ0)
+    θ = copy(θ_init)
+    
     sd = max.(vec(std(Matrix(θ[:, rv_names]); dims = 1)), 1e-3)
-    logtarget(df) = prior(df[:, rv_names]) .+ [Lhat(row) for row in eachrow(Matrix(df[:, rv_names]))]
-    cur = logtarget(θ)
+    logtarget(df) = log_prior(df[:, rv_names]) .+ [loglikeli_hat(row) for row in eachrow(Matrix(df[:, rv_names]))]
+    current_lp = logtarget(θ)
+    
+    # MH steps
     for _ in 1:n_steps
-        prop = copy(θ)
-        prop[:, rv_names] = Matrix(prop[:, rv_names]) .+ randn(n, d) .* sd'
-        lp = logtarget(prop)
-        accept = min.(0.0, lp .- cur) .>= log.(rand(n))
-        Xc = Matrix(θ[:, rv_names])
-        Xc[accept, :] = Matrix(prop[:, rv_names])[accept, :]
-        θ[:, rv_names] = Xc
-        cur[accept] .= lp[accept]
+        candidate = copy(θ)
+        candidate[:, rv_names] = Matrix(candidate[:, rv_names]) .+ randn(n, d) .* sd'
+        
+        candidate_lp = logtarget(candidate)
+        
+        accept = min.(0.0, candidate_lp .- current_lp) .>= log.(rand(n))
+        for i in findall(accept)
+            θ[i, rv_names] = candidate[i, rv_names]
+            current_lp[i] = candidate_lp[i]
+        end
     end
     return θ
 end
@@ -544,8 +553,8 @@ function bayesianupdating(
     covariance_method = LinearShrinkage(DiagonalUnitVariance(), :lw)
     S = 0.0
     model_calls = 0
-    θ* = DataFrame()
-    L* = Vector{Float64}()
+    θⱼ = DataFrame()
+    Lⱼ = Vector{Float64}()
     n_old = 0    # number of particles of the previous stage
     d_old = 0    # number of random variables of the previous stage
 
@@ -563,23 +572,23 @@ function bayesianupdating(
         # for stage 1 additional initialization (same as TMCMC)
         if stage == 1
 
-            β* = 0.0                                    # tempering
+            βⱼ = 0.0                                    # tempering
 
-            θ* = sample(stmcmc.prior[1:n_rv], n_curr)   # prior samples
+            θⱼ = sample(stmcmc.prior[1:n_rv], n_curr)   # prior samples
 
             # eval forward model if supplied
             if !isempty(models)
-                evaluate!(models, θ*)
+                evaluate!(models, θⱼ)
             end
 
         else    # for stage >= 2 use previous results for initialization
 
             # 1. weighted resampling of the previous stage's particles using their
             #    final (beta = 1) posterior weights - no new likelihood evaluations
-            w_old = exp.(L* .- maximum(L*))
+            w_old = exp.(Lⱼ .- maximum(Lⱼ))
             idx_resample = StatsBase.sample(collect(1:n_old), FrequencyWeights(w_old), n_curr; replace = true)
-            θ_old = θ*[idx_resample, :]
-            L_old = L*[idx_resample]
+            θ_old = θⱼ[idx_resample, :]
+            L_old = Lⱼ[idx_resample]
 
             # 2. initialize the newly added dimensions from the prior and evaluate once
             θ_new = sample(stmcmc.prior[d_old+1:n_rv], n_curr)
@@ -593,14 +602,14 @@ function bayesianupdating(
 
             if stmcmc.transition isa SurrogateTransition
 
-                # 3. fit a per-stage surrogate of the log-likelihood and refine the
-                #    particles with a short surrogate-only Markov chain (no forward solves)
+                # 3. fit a per-stage surrogate to the log-likelihood and 
+                #   refine the particles with a short Markov chain (surrogate-only)
                 if stmcmc.transition.surrogate_steps > 0
-                    Lhat = _fit_surrogate(
+                    Lⱼ = _fit_surrogate(
                         stmcmc.transition.surrogate, Matrix(θ_curr[:, rv_names]), L_curr
                     )
                     θ_curr = _surrogate_refine(
-                        prior, Lhat, θ_curr, rv_names, stmcmc.transition.surrogate_steps
+                        prior, Lⱼ, θ_curr, rv_names, stmcmc.transition.surrogate_steps
                     )
                     if !isempty(models)
                         evaluate!(models, θ_curr)
@@ -613,77 +622,78 @@ function bayesianupdating(
                 #    incremental likelihood L_curr - L_old (previous stage at beta = 1)
                 adjust_curr = maximum(L_curr)
                 adjust_old = maximum(L_old)
-                γ, w* = _beta_and_weights(0.0, L_curr .- adjust_curr; extra = L_old .- adjust_old)
+                γ, w_hat = _beta_and_weights(0.0, L_curr .- adjust_curr; extra = L_old .- adjust_old)
 
                 # resample based on the new weights to get the initial samples for the current stage
-                S += log(mean(w*)) + γ * adjust_curr - adjust_old
-                idx = StatsBase.sample(collect(1:n_curr), FrequencyWeights(w* ./ sum(w*)), n_curr; replace = true)
+                S += log(mean(w_hat)) + γ * adjust_curr - adjust_old
+                idx = StatsBase.sample(collect(1:n_curr), FrequencyWeights(w_hat ./ sum(w_hat)), n_curr; replace = true)
 
-                θ* = θ_curr[idx, :]
-                L* = L_curr[idx]
-                β* = γ
+                θⱼ = θ_curr[idx, :]
+                Lⱼ = L_curr[idx]
+                βⱼ = γ
 
             else    # FreezeUnfreezeTransition: start from beta = 0, freeze old dims until ESS stabilizes
 
-                L* = L_curr
-                θ* = θ_curr
-                β* = 0.0
+                Lⱼ = L_curr
+                θⱼ = θ_curr
+                βⱼ = 0.0
 
             end
 
-            @info("Finished initialization of stage $(stage), starting with β=$(β*) and S=$(S)!")
+            @info("Finished initialization of stage $(stage), starting with β=$(βⱼ) and S=$(S)!")
         end
 
         # inner β loop
-        while β* < 1
+        while βⱼ < 1
             j += 1
 
-            likelihood_j = stmcmc.islog ? likelihood(θ*) : log.(likelihood(θ*))
+            likelihood_j = stmcmc.islog ? likelihood(θⱼ) : log.(likelihood(θⱼ))
 
             adjust = Distributions.maximum(likelihood_j)
 
-            β*⁺, w* = _beta_and_weights(β*, likelihood_j .- adjust)
+            βⱼ⁺, w_hat = _beta_and_weights(βⱼ, likelihood_j .- adjust)
 
-            @debug "β*" β*⁺
+            @debug "βⱼ" βⱼ⁺
 
-            S += (log(mean(w*)) + (β*⁺ - β*) * adjust)
+            S += (log(mean(w_hat)) + (βⱼ⁺ - βⱼ) * adjust)
 
-            weights = FrequencyWeights(w* ./ sum(w*))
+            weights = FrequencyWeights(w_hat ./ sum(w_hat))
 
             idx = StatsBase.sample(collect(1:(n_curr)), weights, n_curr; replace=true)
 
-            θ*⁺ = θ*[idx, :]
+            θⱼ⁺ = θⱼ[idx, :]
 
             # freeze/unfreeze decision based on the ESS of the resampling weights:
             # while the ESS is low (new dimensions not yet annealed), the MH proposal
             # only moves the newly added dimensions; once the ESS stabilizes above
             # the threshold, all active dimensions are unfrozen
-            frozen = false
+            is_frozen = false
             if stage > 1 && stmcmc.transition isa FreezeUnfreezeTransition
-                frozen = _ess(w*) < stmcmc.transition.ess_threshold * n_curr
+                is_frozen = _ess(w_hat) < stmcmc.transition.ess_threshold * n_curr
             end
-            prop_names = frozen ? rv_names[d_old+1:end] : rv_names
+            prop_names = is_frozen ? rv_names[d_old+1:end] : rv_names
+            
+            Σⱼ = stmcmc.β^2 * cov(covariance_method, Matrix(θⱼ⁺[:, prop_names]))
 
-            Σ* = stmcmc.β^2 * cov(covariance_method, Matrix(θ*⁺[:, prop_names]))
-
-            U = cholesky(Σ*).U   # factorize once for MvNormal sampler in MH part
+            # creating zero-means MvNormal, since cov stays constant along MCMC chains
+            mv_normal = MvNormal(zeros(length(prop_names)), Σⱼ)
 
             # Run inner MH algorithm
 
             chain = Vector{DataFrame}(undef, stmcmc.burnin + 2)
 
-            chain[1] = copy(θ*⁺)
+            chain[1] = copy(θⱼ⁺)
 
             target = if stmcmc.islog
-                df -> likelihood(df) .* β*⁺ .+ prior(df[:,rv_names])
+                df -> likelihood(df) .* βⱼ⁺ .+ prior(df[:,rv_names])
             else
-                df -> log.(likelihood(df)) .* β*⁺ .+ log.(prior(df[:,rv_names]))
+                df -> log.(likelihood(df)) .* βⱼ⁺ .+ log.(prior(df[:,rv_names]))
             end
 
             for i in 2:(stmcmc.burnin + 2)
                 next = copy(chain[i - 1])
 
-                next[:, prop_names] = Matrix(next[:, prop_names]) .+ randn(n_curr, length(prop_names)) * U
+                next[:, prop_names] = Matrix(next[:, prop_names]) .+ transpose(rand(mv_normal, n_curr))
 
                 # safeguard for Inf in the prior
                 idx_inf = findall(isinf, prior(next[:, rv_names]))
@@ -691,7 +701,7 @@ function bayesianupdating(
                 while !isempty(idx_inf)
 
                     means = Matrix(chain[i - 1][idx_inf, prop_names])
-                    next[idx_inf, prop_names] = means .+ randn(length(idx_inf), length(prop_names)) * U
+                    next[idx_inf, prop_names] = means .+ transpose(rand(mv_normal, length(idx_inf)))
 
                     still_inf = isinf.(prior(next[idx_inf, rv_names]))            # only re-check candidates
                     idx_inf = idx_inf[still_inf]
@@ -712,15 +722,15 @@ function bayesianupdating(
                 chain[i] = next
             end
 
-            θ*⁺ = chain[end]
+            θⱼ⁺ = chain[end]
 
-            β* = β*⁺
-            θ* = θ*⁺
+            βⱼ = βⱼ⁺
+            θⱼ = θⱼ⁺
 
         end # β loop
 
         # store final likelihoods of the stage for the weighted resampling of the next stage
-        L* = stmcmc.islog ? likelihood(θ*) : log.(likelihood(θ*))
+        Lⱼ = stmcmc.islog ? likelihood(θⱼ) : log.(likelihood(θⱼ))
 
         model_calls += n_curr * (1 + j * (1 + stmcmc.burnin))
         n_old = n_curr
@@ -730,7 +740,7 @@ function bayesianupdating(
 
     @debug "Model Calls" model_calls
 
-    return θ*, S
+    return θⱼ, S
 end
 
 function bayesianupdating(
