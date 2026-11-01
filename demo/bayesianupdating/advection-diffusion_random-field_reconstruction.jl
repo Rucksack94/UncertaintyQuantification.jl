@@ -7,9 +7,13 @@ using SparseArrays
 using DataFrames
 using Plots
 import StatsPlots
+using CSV
 
 Random.seed!(13)
 ENV["JULIA_DEBUG"] = "UncertaintyQuantification"
+
+figdir = joinpath(@__DIR__, "figs")
+mkpath(figdir)
 
 ## advection-diffusion problem
     # code below assumes 2D square domain [0,hx*nx]×[0,hy*ny]
@@ -151,7 +155,8 @@ sample_d(samp;λ=0.1) = λ .* exp.(@views grf.data.eigenfunc[:, eachindex(samp)]
 # per particle:
 s_ref = randn(T_ref)
 d_ref = sample_d(s_ref)
-heatmap(xunique,yunique,reshape(d_ref,(nx,ny))',title="Reference Diffusion field")
+f_ref = heatmap(xunique,yunique,reshape(d_ref,(nx,ny))',title="Reference Diffusion field")
+savefig(f_ref, joinpath(figdir, "d_ref.png"))
 
 u_ref = forward_solve_imex(d_ref, u0, vx, vy, adp, dt, nsteps, n_out)
 p = []
@@ -160,7 +165,8 @@ for i = 1:size(u_ref,2)
     plot!(f,xlims=(0,Lx),ylims=(0,Ly))
     push!(p,f)
 end
-plot(p...,layout=(2,3),size=(1000,500))
+p_ref = plot(p...,layout=(2,3),size=(1000,500))
+savefig(p_ref, joinpath(figdir, "u_ref_frames.png"))
 
 u_noise = max.(u_ref .+ randn(size(u_ref)) .* σ_noise, 0.0)
 #u_noise = u_ref .* (1.0 .+ randn(size(u_ref)) .* σ_noise)
@@ -170,7 +176,8 @@ for i = 1:size(u_noise,2)
     plot!(f,xlims=(0,Lx),ylims=(0,Ly))
     push!(p,f)
 end
-plot(p...,layout=(2,3),size=(1000,500))
+p_noise = plot(p...,layout=(2,3),size=(1000,500))
+savefig(p_noise, joinpath(figdir, "u_noise_frames.png"))
 
 ## define forward model
 ic = Vector(u_noise[:,1])
@@ -209,7 +216,7 @@ end
 ad_model = Model(eval_ad_model, :AdvDiff)
 
 # define rest for sTMCMC
-function loglikelihood(df)
+function loglikelihood(df::DataFrame)
     evals = df.AdvDiff
     log_ll = zeros(length(evals))
     for n in eachindex(evals)
@@ -227,13 +234,23 @@ prior = RandomVariable.(Normal(), [Symbol("ξ$(i)") for i in 1:T_reco])
 
 nrv_vec = [5:5:T_reco;]
 particle_factor = 10
-burnin = 2
+burnin = 1
 seqtmcmc = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin)
 
-# eval SeqTMCMC
+# eval SeqTMCMC (surrogate transition)
 model_calls[] = 0
 t_seq = @elapsed stmcmc_samples, stmcmc_evidence = bayesianupdating(loglikelihood, [ad_model], seqtmcmc);
 ncalls_seq = model_calls[]
+
+# eval SeqTMCMC (freeze/unfreeze transition)
+seqtmcmc_freeze = SequentialTMCMC(prior, nrv_vec, particle_factor, burnin; transition = FreezeUnfreezeTransition())
+model_calls[] = 0
+t_seq_freeze = @elapsed stmcmc_samples_freeze, stmcmc_evidence_freeze = bayesianupdating(loglikelihood, [ad_model], seqtmcmc_freeze);
+ncalls_seq_freeze = model_calls[]
+final_coefs_seq_freeze = Matrix(stmcmc_samples_freeze[:,names(prior)]);
+s_reco_seq_freeze = vec(sum(final_coefs_seq_freeze, dims=1)./size(final_coefs_seq_freeze,1));
+d_reco_seq_freeze = sample_d(s_reco_seq_freeze);
+u_reco_seq_freeze = forward_solve_imex(d_reco_seq_freeze, u0, vx, vy, adp, dt, nsteps, n_out);
 final_coefs_seq = Matrix(stmcmc_samples[:,names(prior)]) ;
 s_reco_seq = vec(sum(final_coefs_seq, dims=1)./size(final_coefs_seq,1));
 d_reco_seq = sample_d(s_reco_seq);
@@ -250,15 +267,36 @@ s_reco = vec(sum(final_coefs, dims=1)./size(final_coefs,1));
 d_reco = sample_d(s_reco);
 u_reco = forward_solve_imex(d_reco, u0, vx, vy, adp, dt, nsteps, n_out);
 
-# benchmark: runtime, forward solves, evidence
-println("=== Random-field (diffusion) reconstruction benchmark ===")
-println("method   | time [s] | forward solves | log-evidence")
-println("SeqTMCMC | $(round(t_seq, digits=1)) | $ncalls_seq | $(round(stmcmc_evidence, digits=2))")
-println("TMCMC    | $(round(t_tmcmc, digits=1)) | $ncalls_tmcmc | $(round(tmcmc_evidence, digits=2))")
-
 # compute low order reference
 s_ref_low = (grf.data.eigenfunc[:, 1:T_reco] * Diagonal(grf.data.eigenval[1:T_reco])) \ log.(d_ref ./ 0.1);
 d_ref_low = sample_d(s_ref_low);
+
+# Mixed Root Mean Square (MRMS) error
+mrms(ref,approx) = sqrt(sum( ((ref .- approx)/(1.0 .+ abs.(ref))).^2 )/prod(size(ref))) ;
+d_mrms_seq = mrms(d_reco_seq,d_ref_low) ;
+d_mrms = mrms(d_reco,d_ref_low);
+u_true_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_ref)) ;
+u_true_mrms = mrms(Matrix(u_reco),Matrix(u_ref));
+d_mrms_seq_freeze = mrms(d_reco_seq_freeze,d_ref_low);
+u_true_mrms_seq_freeze = mrms(Matrix(u_reco_seq_freeze),Matrix(u_ref));
+
+# benchmark: runtime, forward solves, evidence
+println("=== Random-field (diffusion) reconstruction benchmark ===")
+println("method                | time [s] | forward solves | log-evidence | MRMS(d) | MRMS(u,u_ref)")
+println("SeqTMCMC surrogate    | $(round(t_seq, digits=1)) | $ncalls_seq | $(round(stmcmc_evidence, digits=2)) | $(round(d_mrms_seq*100,digits=3))% | $(round(u_true_mrms_seq*100,digits=3))%")
+println("SeqTMCMC freeze/unfr. | $(round(t_seq_freeze, digits=1)) | $ncalls_seq_freeze | $(round(stmcmc_evidence_freeze, digits=2)) | $(round(d_mrms_seq_freeze*100,digits=3))% | $(round(u_true_mrms_seq_freeze*100,digits=3))%")
+println("TMCMC                 | $(round(t_tmcmc, digits=1)) | $ncalls_tmcmc | $(round(tmcmc_evidence, digits=2)) | $(round(d_mrms*100,digits=3))% | $(round(u_true_mrms*100,digits=3))%")
+
+#save to CSV
+bench_df = DataFrame(
+    method = ["SeqTMCMC_surrogate", "SeqTMCMC_freeze_unfreeze", "TMCMC"],
+    time_s = [t_seq, t_seq_freeze, t_tmcmc],
+    forward_solves = [ncalls_seq, ncalls_seq_freeze, ncalls_tmcmc],
+    log_evidence = [stmcmc_evidence, stmcmc_evidence_freeze, tmcmc_evidence],
+    mrms_d = [d_mrms_seq, d_mrms_seq_freeze, d_mrms],
+    mrms_u_vs_ref = [u_true_mrms_seq, u_true_mrms_seq_freeze, u_true_mrms],
+)
+CSV.write(joinpath(figdir, "benchmark_diffusion.csv"), bench_df)
 
 # Boxplot RF coefficients
 final_coefs_seq .-= s_ref_low[1:T_reco]' 
@@ -268,14 +306,9 @@ bp = StatsPlots.boxplot(repeat(1:T_reco, inner=size(final_coefs_seq,1)), vec(fin
 StatsPlots.boxplot!(bp,repeat(1:T_reco, inner=size(final_coefs,1)), vec(final_coefs);
         outliers=false, label="TMCMC",fillalpha=0.75,linewidth=0,legend=:outertop,legend_columns=2);
 plot!(bp,size=(800,500),guidefontsize=16,tickfontsize=14,legendfontsize=16,xticks=nrv_vec)
+savefig(bp, joinpath(figdir, "coef_boxplot.png"))
 
-
-# Mixed Root Mean Square (MRMS) error
-mrms(ref,approx) = sqrt(sum( ((ref .- approx)/(1.0 .+ abs.(ref))).^2 )/prod(size(ref))) ;
-d_mrms_seq = mrms(d_reco_seq,d_ref_low) ;
-d_mrms = mrms(d_reco,d_ref_low);
-u_true_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_ref)) ;
-u_true_mrms = mrms(Matrix(u_reco),Matrix(u_ref));
+# remaining MRMS quantities
 u_mrms_seq = mrms(Matrix(u_reco_seq),Matrix(u_noise)) ;
 u_mrms = mrms(Matrix(u_reco),Matrix(u_noise));
 ulocal_true_mrms_seq = mrms.(Matrix(u_reco_seq),Matrix(u_ref)) ;
@@ -289,7 +322,8 @@ href  = heatmap(xunique,yunique,reshape(d_ref,(nx,ny))',clims=(0.0,1.5),title="R
 hreflow  = heatmap(xunique,yunique,reshape(d_ref_low,(nx,ny))',clims=(0.0,1.5),title="Reference T=$(T_reco)");
 hreco_seq = heatmap(xunique,yunique,reshape(d_reco_seq,(nx,ny))',clims=(0.0,1.5),title="SeqTMCMC T=$(T_reco) \n MRMS_T=$(round(d_mrms_seq*100,digits=3))%");
 hreco = heatmap(xunique,yunique,reshape(d_reco,(nx,ny))',clims=(0.0,1.5),title="TMCMC T=$(T_reco) \n MRMS_T=$(round(d_mrms*100,digits=3))%");
-plot!(href,hreflow,hreco_seq,hreco,layout=(2,2),size=(800,800))
+diff_fig = plot!(href,hreflow,hreco_seq,hreco,layout=(2,2),size=(800,800))
+savefig(diff_fig,joinpath(figdir, "d_reconstructions.png"))
 
 # Gif concentration field
 anim = @animate for frame in axes(u_ref,2)
@@ -301,7 +335,7 @@ anim = @animate for frame in axes(u_ref,2)
     ereco = heatmap(xunique,yunique,reshape(ulocal_true_mrms[:,frame],(nx,ny))',clims=(0.0,maxMRMS),title="TMCMC MRMS(u,u_ref)=$(round(u_true_mrms*100,digits=3))%");
     plot!(uref,ureco_seq,ereco_seq,unoise,ureco,ereco,layout=(2,3),size=(1200,800))
 end
-gif(anim, fps=2)
+gif(anim, joinpath(figdir, "u_reconstruction.gif"), fps=2)
 
 
 ## ---------------------------------------------------------------------------
@@ -362,3 +396,46 @@ println("method   | time [s] | forward solves | log-evidence | mean vx | mean vy
 println("SeqTMCMC | $(round(t_seq_vel, digits=2)) | $ncalls_seq_vel | $(round(vel_evidence_seq, digits=2)) | $(round(mean(vel_samples_seq.vx), digits=3)) | $(round(mean(vel_samples_seq.vy), digits=3))")
 println("TMCMC    | $(round(t_tmcmc_vel, digits=2)) | $ncalls_tmcmc_vel | $(round(vel_evidence_tmcmc, digits=2)) | $(round(mean(vel_samples_tmcmc.vx), digits=3)) | $(round(mean(vel_samples_tmcmc.vy), digits=3))")
 println("reference: vx = $vx, vy = $vy")
+
+# save as csv
+bench_vel_df = DataFrame(
+    method = ["SeqTMCMC", "TMCMC"],
+    time_s = [t_seq_vel, t_tmcmc_vel],
+    forward_solves = [ncalls_seq_vel, ncalls_tmcmc_vel],
+    log_evidence = [vel_evidence_seq, vel_evidence_tmcmc],
+    mean_vx = [mean(vel_samples_seq.vx), mean(vel_samples_tmcmc.vx)],
+    mean_vy = [mean(vel_samples_seq.vy), mean(vel_samples_tmcmc.vy)],
+)
+CSV.write(joinpath(figdir, "benchmark_velocity.csv"), bench_vel_df)
+
+# velocity posterior plots: scatter + marginals, SeqTMCMC vs TMCMC with reference point
+vel_scatter = StatsPlots.scatter(vel_samples_seq.vx, vel_samples_seq.vy;
+        xlabel="vx", ylabel="vy", label="SeqTMCMC", markersize=2, markerstrokewidth=0, alpha=0.5)
+StatsPlots.scatter!(vel_scatter, vel_samples_tmcmc.vx, vel_samples_tmcmc.vy;
+        label="TMCMC", markersize=2, markerstrokewidth=0, alpha=0.5)
+StatsPlots.scatter!(vel_scatter, [vx], [vy];
+        label="reference", markersize=8, color=:red, marker=:star5)
+savefig(vel_scatter, joinpath(figdir, "vel_posterior_scatter.png"))
+
+vel_marginals = StatsPlots.plot(layout=(1,2), size=(900,400))
+StatsPlots.density!(vel_marginals[1], vel_samples_seq.vx; label="SeqTMCMC", xlabel="vx", title="vx marginal")
+StatsPlots.density!(vel_marginals[1], vel_samples_tmcmc.vx; label="TMCMC")
+vline!(vel_marginals[1], [vx]; label="reference", color=:red, linestyle=:dash)
+StatsPlots.density!(vel_marginals[2], vel_samples_seq.vy; label="SeqTMCMC", xlabel="vy", title="vy marginal")
+StatsPlots.density!(vel_marginals[2], vel_samples_tmcmc.vy; label="TMCMC")
+vline!(vel_marginals[2], [vy]; label="reference", color=:red, linestyle=:dash)
+savefig(vel_marginals, joinpath(figdir, "vel_posterior_marginals.png"))
+
+# reconstructed concentration field for the posterior-mean velocities
+u_reco_vel_seq = forward_solve_imex(d_fixed, u0, mean(vel_samples_seq.vx), mean(vel_samples_seq.vy), adp, dt, nsteps, n_out)
+u_reco_vel_tmcmc = forward_solve_imex(d_fixed, u0, mean(vel_samples_tmcmc.vx), mean(vel_samples_tmcmc.vy), adp, dt, nsteps, n_out)
+mrms_u_vel_seq = mrms(Matrix(u_reco_vel_seq), Matrix(u_vel_ref))
+mrms_u_vel_tmcmc = mrms(Matrix(u_reco_vel_tmcmc), Matrix(u_vel_ref))
+
+anim_vel = @animate for frame in axes(u_vel_ref, 2)
+    uref = heatmap(xunique, yunique, reshape(u_vel_ref[:,frame], (nx,ny))'; clims=(0.0,2.0), title="True u (vx=$vx, vy=$vy) frame=$(frame)")
+    useq = heatmap(xunique, yunique, reshape(u_reco_vel_seq[:,frame], (nx,ny))'; clims=(0.0,2.0), title="SeqTMCMC u frame=$(frame)\nMRMS=$(round(mrms_u_vel_seq*100,digits=3))%")
+    utmcmc = heatmap(xunique, yunique, reshape(u_reco_vel_tmcmc[:,frame], (nx,ny))'; clims=(0.0,2.0), title="TMCMC u frame=$(frame)\nMRMS=$(round(mrms_u_vel_tmcmc*100,digits=3))%")
+    plot!(uref, useq, utmcmc, layout=(1,3), size=(1400,400))
+end
+gif(anim_vel, joinpath(figdir, "u_reconstruction_velocity.gif"), fps=2)
